@@ -262,7 +262,19 @@ export class RiskManagementEngine {
     db.systemHealth.circuitBreakerTripped = false;
     db.systemHealth.globalKillSwitchActive = false;
     db.systemHealth.tradingEngineStatus = 'RUNNING';
-    this.dailyLossTracker.delete(userId);
+    
+    // Clear all daily loss tracking records for this user
+    for (const key of this.dailyLossTracker.keys()) {
+      if (key === userId || key.startsWith(`${userId}_`)) {
+        this.dailyLossTracker.delete(key);
+      }
+    }
+
+    const settings = db.botSettings.get(userId);
+    if (settings) {
+      settings.circuitBreakerActive = false;
+    }
+
     db.logAudit(userId, 'RISK_UPDATE', 'Circuit breaker reset by user/admin.', 'INFO');
     db.addNotification('Circuit Breaker Reset', 'Trading engine resumed normal operations.', 'SYSTEM');
   }

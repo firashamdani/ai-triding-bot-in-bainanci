@@ -253,7 +253,7 @@ export interface AuditLog {
   id: string;
   timestamp: string;
   userId: string;
-  action: 'LOGIN' | 'BINANCE_CONNECT' | 'BOT_START' | 'BOT_STOP' | 'STRATEGY_UPDATE' | 'RISK_UPDATE' | 'TRADE_OPEN' | 'TRADE_CLOSE' | 'EMERGENCY_STOP' | 'API_ERROR' | 'ADMIN_KILL_SWITCH';
+  action: 'LOGIN' | 'BINANCE_CONNECT' | 'BOT_START' | 'BOT_STOP' | 'STRATEGY_UPDATE' | 'RISK_UPDATE' | 'TRADE_OPEN' | 'TRADE_CLOSE' | 'EMERGENCY_STOP' | 'API_ERROR' | 'ADMIN_KILL_SWITCH' | 'SECURITY_ALERT';
   details: string;
   ipAddress?: string;
   severity: 'INFO' | 'WARNING' | 'ALERT';

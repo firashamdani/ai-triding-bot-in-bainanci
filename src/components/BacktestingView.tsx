@@ -49,6 +49,10 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
 }) => {
   const t = translations[lang];
 
+  // Defensive unwrapping to support both direct object and wrapped responses
+  const result: Backtest | null = (backtestResult as any)?.backtest || backtestResult;
+  const wfResult: WalkForwardResult | null = (walkForwardResult as any)?.walkForward || walkForwardResult;
+
   const [activeTab, setActiveTab] = useState<'STANDARD' | 'WALK_FORWARD' | 'PAPER_VS_LIVE'>('STANDARD');
 
   // Form parameters
@@ -323,7 +327,7 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
 
           {/* Results Summary & Equity Curve */}
           <div className="lg:col-span-2 space-y-6">
-            {backtestResult ? (
+            {result ? (
               <>
                 {/* Metric Cards */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -331,40 +335,40 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
                     <span className="text-slate-400 text-xs block">{t.netProfit}</span>
                     <span
                       className={`text-lg font-bold font-mono-num ${
-                        backtestResult.netProfit >= 0 ? 'text-emerald-400' : 'text-red-400'
+                        (result.netProfit ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
                       }`}
                     >
-                      {backtestResult.netProfit >= 0 ? '+' : ''}${backtestResult.netProfit.toFixed(2)}
+                      {(result.netProfit ?? 0) >= 0 ? '+' : ''}${(result.netProfit ?? 0).toFixed(2)}
                     </span>
                     <span className="text-[10px] text-slate-400 block font-mono-num">
-                      {backtestResult.netReturnPercent >= 0 ? '+' : ''}{backtestResult.netReturnPercent.toFixed(1)}% Return
+                      {(result.netReturnPercent ?? 0) >= 0 ? '+' : ''}{(result.netReturnPercent ?? 0).toFixed(1)}% Return
                     </span>
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800">
                     <span className="text-slate-400 text-xs block">{t.winRate}</span>
                     <span className="text-lg font-bold font-mono-num text-purple-400">
-                      {backtestResult.winRate.toFixed(1)}%
+                      {(result.winRate ?? 0).toFixed(1)}%
                     </span>
                     <span className="text-[10px] text-slate-400 block font-mono-num">
-                      {backtestResult.winningTrades}W / {backtestResult.losingTrades}L ({backtestResult.totalTrades} total)
+                      {result.winningTrades ?? 0}W / {result.losingTrades ?? 0}L ({result.totalTrades ?? 0} total)
                     </span>
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800">
                     <span className="text-slate-400 text-xs block">{t.profitFactor}</span>
                     <span className="text-lg font-bold font-mono-num text-slate-100">
-                      {backtestResult.profitFactor.toFixed(2)}
+                      {(result.profitFactor ?? 0).toFixed(2)}
                     </span>
                     <span className="text-[10px] text-slate-400 block font-mono-num">
-                      Sharpe: {backtestResult.sharpeRatio.toFixed(2)}
+                      Sharpe: {(result.sharpeRatio ?? 0).toFixed(2)}
                     </span>
                   </div>
 
                   <div className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800">
                     <span className="text-slate-400 text-xs block">{t.maxDrawdown}</span>
                     <span className="text-lg font-bold font-mono-num text-red-400">
-                      -{backtestResult.maxDrawdownPercent.toFixed(1)}%
+                      -{(result.maxDrawdownPercent ?? 0).toFixed(1)}%
                     </span>
                     <span className="text-[10px] text-slate-400 block font-mono-num">
                       Safe capital threshold
@@ -377,26 +381,26 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
                     {t.equityCurveTitle}
                   </h3>
-                  {renderEquityCurve(backtestResult.equityCurve)}
+                  {renderEquityCurve(result.equityCurve || [])}
                 </div>
 
                 {/* Detailed Breakdown */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs bg-slate-900/60 p-3 rounded-xl border border-slate-800 font-mono-num">
                   <div>
                     <span className="text-slate-400 text-[10px] block">{t.avgWin}:</span>
-                    <span className="text-emerald-400 font-semibold">+${backtestResult.averageTradeProfit.toFixed(2)}</span>
+                    <span className="text-emerald-400 font-semibold">+${(result.averageTradeProfit ?? 0).toFixed(2)}</span>
                   </div>
                   <div>
                     <span className="text-slate-400 text-[10px] block">{t.avgLoss}:</span>
-                    <span className="text-red-400 font-semibold">-${Math.abs(backtestResult.averageTradeLoss).toFixed(2)}</span>
+                    <span className="text-red-400 font-semibold">-${Math.abs(result.averageTradeLoss ?? 0).toFixed(2)}</span>
                   </div>
                   <div>
                     <span className="text-slate-400 text-[10px] block">{t.largestWin}:</span>
-                    <span className="text-emerald-400 font-semibold">+${backtestResult.largestWin.toFixed(2)}</span>
+                    <span className="text-emerald-400 font-semibold">+${(result.largestWin ?? 0).toFixed(2)}</span>
                   </div>
                   <div>
                     <span className="text-slate-400 text-[10px] block">{t.largestLoss}:</span>
-                    <span className="text-red-400 font-semibold">-${Math.abs(backtestResult.largestLoss).toFixed(2)}</span>
+                    <span className="text-red-400 font-semibold">-${Math.abs(result.largestLoss ?? 0).toFixed(2)}</span>
                   </div>
                 </div>
               </>
@@ -433,14 +437,14 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
             </button>
           </div>
 
-          {walkForwardResult ? (
+          {wfResult ? (
             <div className="space-y-6">
               {/* Verdict Banner */}
               <div
                 className={`p-4 rounded-xl border flex items-center justify-between ${
-                  walkForwardResult.robustnessVerdict === 'ROBUST'
+                  wfResult.robustnessVerdict === 'ROBUST'
                     ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
-                    : walkForwardResult.robustnessVerdict === 'MODERATE'
+                    : wfResult.robustnessVerdict === 'MODERATE'
                     ? 'bg-amber-500/10 border-amber-500/40 text-amber-300'
                     : 'bg-red-500/10 border-red-500/40 text-red-300'
                 }`}
@@ -449,17 +453,17 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
                   <CheckCircle2 className="w-5 h-5" />
                   <div>
                     <span className="text-xs font-bold uppercase tracking-wider block">
-                      Robustness Verdict: {walkForwardResult.robustnessVerdict}
+                      Robustness Verdict: {wfResult.robustnessVerdict}
                     </span>
                     <span className="text-xs text-slate-300">
-                      Efficiency Ratio (Out-of-sample Sharpe / In-sample Sharpe): {walkForwardResult.efficiencyRatio}
+                      Efficiency Ratio (Out-of-sample Sharpe / In-sample Sharpe): {wfResult.efficiencyRatio}
                     </span>
                   </div>
                 </div>
                 <div className="text-xs font-bold font-mono-num">
-                  {walkForwardResult.robustnessVerdict === 'ROBUST'
+                  {wfResult.robustnessVerdict === 'ROBUST'
                     ? 'Low Overfitting Risk'
-                    : walkForwardResult.robustnessVerdict === 'MODERATE'
+                    : wfResult.robustnessVerdict === 'MODERATE'
                     ? 'Moderate Generalization'
                     : 'Severe Overfitting Caution'}
                 </div>
@@ -476,19 +480,19 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
                   <div className="space-y-1 text-xs font-mono-num">
                     <div className="flex justify-between">
                       <span className="text-slate-400">Total Trades:</span>
-                      <span className="text-slate-200">{walkForwardResult.inSample.totalTrades}</span>
+                      <span className="text-slate-200">{wfResult.inSample?.totalTrades ?? 0}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Win Rate:</span>
-                      <span className="text-emerald-400">{walkForwardResult.inSample.winRate}%</span>
+                      <span className="text-emerald-400">{(wfResult.inSample?.winRate ?? 0).toFixed(1)}%</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Profit Factor:</span>
-                      <span className="text-slate-200">{walkForwardResult.inSample.profitFactor}</span>
+                      <span className="text-slate-200">{(wfResult.inSample?.profitFactor ?? 0).toFixed(2)}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Sharpe Ratio:</span>
-                      <span className="text-amber-400">{walkForwardResult.inSample.sharpeRatio}</span>
+                      <span className="text-amber-400">{(wfResult.inSample?.sharpeRatio ?? 0).toFixed(2)}</span>
                     </div>
                   </div>
                 </div>
@@ -502,19 +506,19 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
                   <div className="space-y-1 text-xs font-mono-num">
                     <div className="flex justify-between">
                       <span className="text-slate-400">Total Trades:</span>
-                      <span className="text-slate-200">{walkForwardResult.outOfSample.totalTrades}</span>
+                      <span className="text-slate-200">{wfResult.outOfSample?.totalTrades ?? 0}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Win Rate:</span>
-                      <span className="text-emerald-400">{walkForwardResult.outOfSample.winRate}%</span>
+                      <span className="text-emerald-400">{(wfResult.outOfSample?.winRate ?? 0).toFixed(1)}%</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Profit Factor:</span>
-                      <span className="text-slate-200">{walkForwardResult.outOfSample.profitFactor}</span>
+                      <span className="text-slate-200">{(wfResult.outOfSample?.profitFactor ?? 0).toFixed(2)}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Sharpe Ratio:</span>
-                      <span className="text-amber-400">{walkForwardResult.outOfSample.sharpeRatio}</span>
+                      <span className="text-amber-400">{(wfResult.outOfSample?.sharpeRatio ?? 0).toFixed(2)}</span>
                     </div>
                   </div>
                 </div>

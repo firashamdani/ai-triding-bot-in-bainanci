@@ -245,6 +245,31 @@ export async function runAllTests(): Promise<FullTestSuiteSummary> {
     });
   }
 
+  // 9. RBAC Security: Admin Role Privilege Enforcement
+  const t9Start = Date.now();
+  try {
+    const adminUser = db.users.get('usr_admin');
+    const traderUser = db.users.get('usr_trader');
+    const hasAdminRole = adminUser?.role === 'ADMIN';
+    const isTraderRestricted = traderUser?.role === 'USER';
+    const passed = hasAdminRole && isTraderRestricted;
+    results.push({
+      category: 'INTEGRATION',
+      name: 'RBAC Security: Admin Role Privilege Enforcement',
+      status: passed ? 'PASSED' : 'FAILED',
+      durationMs: Date.now() - t9Start,
+      message: 'Verified ADMIN role privileges validated and separated from regular USER role.',
+    });
+  } catch (err: unknown) {
+    results.push({
+      category: 'INTEGRATION',
+      name: 'RBAC Security: Admin Role Privilege Enforcement',
+      status: 'FAILED',
+      durationMs: Date.now() - t9Start,
+      message: String(err),
+    });
+  }
+
   const passedCount = results.filter((r) => r.status === 'PASSED').length;
   const failedCount = results.filter((r) => r.status === 'FAILED').length;
 

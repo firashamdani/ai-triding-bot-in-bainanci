@@ -40,6 +40,7 @@ interface NavbarProps {
   systemHealth?: SystemHealth | null;
   notifications?: AppNotification[];
   onMarkNotificationsRead?: () => void;
+  onSwitchRole?: (newRole: 'ADMIN' | 'USER') => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -57,6 +58,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   systemHealth = null,
   notifications = [],
   onMarkNotificationsRead = () => {},
+  onSwitchRole,
 }) => {
   const t = translations[lang];
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -242,14 +244,39 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <div className="text-right hidden sm:block">
                   <div className="text-xs font-bold text-slate-200 flex items-center gap-1 justify-end">
                     {currentUser.name}
-                    {currentUser.role === 'ADMIN' && (
-                      <span className="px-1 py-0.2 rounded bg-amber-500/20 text-amber-400 text-[9px] font-mono-num">
+                    {currentUser.role === 'ADMIN' ? (
+                      <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400 border border-amber-500/40 text-[9px] font-mono-num font-bold">
                         ADMIN
+                      </span>
+                    ) : (
+                      <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 border border-blue-500/40 text-[9px] font-mono-num font-bold">
+                        USER
                       </span>
                     )}
                   </div>
                   <div className="text-[10px] text-slate-400 font-mono-num">{currentUser.email}</div>
                 </div>
+
+                {/* Quick Role Switcher Button */}
+                {onSwitchRole && (
+                  <button
+                    onClick={() => onSwitchRole(currentUser.role === 'ADMIN' ? 'USER' : 'ADMIN')}
+                    className={`px-2 py-1 rounded-lg text-[10px] font-mono-num font-bold border transition-all flex items-center gap-1 shadow-sm ${
+                      currentUser.role === 'ADMIN'
+                        ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 hover:bg-amber-500/25'
+                        : 'bg-blue-500/15 text-blue-300 border-blue-500/40 hover:bg-blue-500/25'
+                    }`}
+                    title={
+                      lang === 'ar'
+                        ? `الرتبة الحالية: ${currentUser.role}. انقر للتبديل إلى ${currentUser.role === 'ADMIN' ? 'USER' : 'ADMIN'}`
+                        : `Current role: ${currentUser.role}. Click to switch to ${currentUser.role === 'ADMIN' ? 'USER' : 'ADMIN'}`
+                    }
+                  >
+                    <span>{currentUser.role === 'ADMIN' ? '👑 Admin' : '👤 Trader'}</span>
+                    <span className="text-[9px] opacity-60">⇄</span>
+                  </button>
+                )}
+
                 <button
                   onClick={onLogout}
                   className="p-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-red-400 transition-colors"

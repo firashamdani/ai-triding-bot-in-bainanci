@@ -27,18 +27,21 @@ import { BotSettingsView } from './components/BotSettingsView';
 import { AdminView } from './components/AdminView';
 import { SystemHealthView } from './components/SystemHealthView';
 import { TradeDetailModal } from './components/TradeDetailModal';
+import { ShieldAlert } from 'lucide-react';
 
 export default function App() {
   const [lang, setLang] = useState<Language>('ar');
   const [currentView, setCurrentView] = useState<AppView>('DASHBOARD');
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(true);
   const [user, setUser] = useState<User>({
-    id: 'usr_admin_01',
-    email: 'trader@binance-ai.internal',
-    name: 'Chief Quant Trader',
+    id: 'usr_admin',
+    email: 'admin@trading.ai',
+    name: 'Super Admin',
     role: 'ADMIN',
     createdAt: new Date().toISOString(),
   });
+  const [authToken, setAuthToken] = useState<string>('tok_usr_admin_default');
+  const isAdmin = user.role === 'ADMIN';
 
   // Trading Core State
   const [tradingMode, setTradingMode] = useState<'PAPER' | 'LIVE'>('PAPER');
@@ -175,23 +178,32 @@ export default function App() {
         if (typeof data.realizedPnl === 'number') setRealizedPnl(data.realizedPnl);
       }
 
-      // Fetch audit logs
-      const logsRes = await fetch('/api/admin/audit-logs');
-      if (logsRes.ok) {
-        const data = await logsRes.json();
-        setAuditLogs(Array.isArray(data.auditLogs) ? data.auditLogs : []);
-      }
+      // Fetch audit logs & admin overview (strictly secured for ADMIN role)
+      if (user.role === 'ADMIN') {
+        const authHeaders = {
+          'Authorization': `Bearer ${authToken}`,
+          'X-User-Id': user.id,
+        };
 
-      // Fetch admin overview (users & metrics)
-      const overviewRes = await fetch('/api/admin/overview');
-      if (overviewRes.ok) {
-        const data = await overviewRes.json();
-        if (Array.isArray(data.users)) setRegisteredUsers(data.users);
+        const logsRes = await fetch('/api/admin/audit-logs', { headers: authHeaders });
+        if (logsRes.ok) {
+          const data = await logsRes.json();
+          setAuditLogs(Array.isArray(data.auditLogs) ? data.auditLogs : []);
+        }
+
+        const overviewRes = await fetch('/api/admin/overview', { headers: authHeaders });
+        if (overviewRes.ok) {
+          const data = await overviewRes.json();
+          if (Array.isArray(data.users)) setRegisteredUsers(data.users);
+        }
+      } else {
+        setAuditLogs([]);
+        setRegisteredUsers([]);
       }
     } catch (err) {
       console.warn('Backend polling warning (running local simulation):', err);
     }
-  }, []);
+  }, [user.id, user.role, authToken]);
 
   const handleMarkNotificationsRead = async () => {
     try {
@@ -426,11 +438,14 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        setBacktestResult(data);
-        showToast('Backtest simulation complete.', 'success');
+        setBacktestResult(data.backtest || data);
+        showToast(lang === 'ar' ? 'اكتملت محاكاة الاختبار التاريخي بنجاح.' : 'Backtest simulation complete.', 'success');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        showToast(err.error || (lang === 'ar' ? 'فشل تشغيل الاختبار التجريبي.' : 'Backtest failed to execute.'), 'error');
       }
     } catch (err) {
-      showToast('Backtest failed to execute.', 'error');
+      showToast(lang === 'ar' ? 'خطأ في تنفيذ الاختبار التجريبي.' : 'Backtest failed to execute.', 'error');
     } finally {
       setIsLoading(false);
     }
@@ -447,10 +462,13 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setWalkForwardResult(data);
-        showToast('Walk-Forward robustness analysis completed.', 'success');
+        showToast(lang === 'ar' ? 'اكتمل فحص Walk-Forward بنجاح.' : 'Walk-Forward robustness analysis completed.', 'success');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        showToast(err.error || (lang === 'ar' ? 'فشل فحص Walk-Forward.' : 'Walk-Forward test failed.'), 'error');
       }
     } catch (err) {
-      showToast('Walk-Forward test failed.', 'error');
+      showToast(lang === 'ar' ? 'خطأ في فحص Walk-Forward.' : 'Walk-Forward test failed.', 'error');
     } finally {
       setIsLoading(false);
     }
@@ -471,53 +489,144 @@ export default function App() {
   };
 
   const handleToggleKillSwitch = async (active: boolean) => {
+    if (user.role !== 'ADMIN') {
+      showToast(
+        lang === 'ar' ? 'تم رفض الإجراء: يتطلب صلاحيات المشرف (ADMIN)' : 'Action Denied: Administrator role required',
+        'error'
+      );
+      return;
+    }
     try {
       const res = await fetch('/api/admin/toggle-kill-switch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+          'X-User-Id': user.id,
+        },
         body: JSON.stringify({ active }),
       });
       if (res.ok) {
-        const data = await res.json();
-        setSystemHealth(data.health);
-        showToast(active ? 'GLOBAL KILL SWITCH ENGAGED.' : 'Global Kill Switch disengaged.', 'error');
+        showToast(
+          active
+            ? (lang === 'ar' ? 'تم تشغيل مفتاح الإيقاف الطارئ الشامل.' : 'GLOBAL KILL SWITCH ENGAGED.')
+            : (lang === 'ar' ? 'تم إلغاء مفتاح الإيقاف الطارئ الشامل.' : 'Global Kill Switch disengaged.'),
+          active ? 'error' : 'success'
+        );
+        fetchAllData();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        showToast(err.error || 'Failed to toggle Kill Switch.', 'error');
       }
-    } catch (err) {
+    } catch {
       showToast('Error modifying Kill Switch.', 'error');
     }
   };
 
   const handleToggleLiveTradingGate = async (enabled: boolean) => {
+    if (user.role !== 'ADMIN') {
+      showToast(
+        lang === 'ar' ? 'تم رفض الإجراء: يتطلب صلاحيات المشرف (ADMIN)' : 'Action Denied: Administrator role required',
+        'error'
+      );
+      return;
+    }
     try {
       const res = await fetch('/api/admin/toggle-live-trading', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+          'X-User-Id': user.id,
+        },
         body: JSON.stringify({ enabled }),
       });
       if (res.ok) {
-        const data = await res.json();
-        setSystemHealth(data.health);
-        showToast(enabled ? 'Live trading gate OPEN.' : 'Live trading gate CLOSED.', 'info');
+        showToast(
+          enabled
+            ? (lang === 'ar' ? 'تم فتح بوابة التداول الحي العالمي.' : 'Live trading gate OPEN.')
+            : (lang === 'ar' ? 'تم إغلاق بوابة التداول الحي العالمي.' : 'Live trading gate CLOSED.'),
+          'info'
+        );
+        fetchAllData();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        showToast(err.error || 'Failed to toggle live trading gate.', 'error');
       }
-    } catch (err) {
+    } catch {
       showToast('Error toggling live trading.', 'error');
     }
   };
 
   const handleToggleRegistrationGate = async (enabled: boolean) => {
+    if (user.role !== 'ADMIN') {
+      showToast(
+        lang === 'ar' ? 'تم رفض الإجراء: يتطلب صلاحيات المشرف (ADMIN)' : 'Action Denied: Administrator role required',
+        'error'
+      );
+      return;
+    }
     try {
       const res = await fetch('/api/admin/toggle-registration', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+          'X-User-Id': user.id,
+        },
         body: JSON.stringify({ enabled }),
       });
       if (res.ok) {
-        const data = await res.json();
-        setSystemHealth(data.health);
-        showToast(enabled ? 'Registration ENABLED.' : 'Registration DISABLED.', 'info');
+        showToast(
+          enabled
+            ? (lang === 'ar' ? 'تم تفعيل تسجيل المستخدمين الجدد.' : 'Registration ENABLED.')
+            : (lang === 'ar' ? 'تم تعطيل تسجيل المستخدمين الجدد.' : 'Registration DISABLED.'),
+          'info'
+        );
+        fetchAllData();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        showToast(err.error || 'Failed to toggle registration gate.', 'error');
       }
-    } catch (err) {
+    } catch {
       showToast('Error toggling registration gate.', 'error');
+    }
+  };
+
+  const handleSwitchRole = (newRole: 'ADMIN' | 'USER') => {
+    if (newRole === 'ADMIN') {
+      setUser({
+        id: 'usr_admin',
+        email: 'admin@trading.ai',
+        name: 'Super Admin',
+        role: 'ADMIN',
+        createdAt: new Date().toISOString(),
+      });
+      setAuthToken('tok_usr_admin_default');
+      showToast(
+        lang === 'ar'
+          ? 'تم تفعيل صلاحيات المشرف (ADMIN) عالمياً في المنصة.'
+          : 'Granted: Full Administrator (ADMIN) role privileges active globally.',
+        'success'
+      );
+    } else {
+      setUser({
+        id: 'usr_trader',
+        email: 'trader@trading.ai',
+        name: 'Pro Trader',
+        role: 'USER',
+        createdAt: new Date().toISOString(),
+      });
+      setAuthToken('tok_usr_trader_default');
+      if (currentView === 'ADMIN') {
+        setCurrentView('DASHBOARD');
+      }
+      showToast(
+        lang === 'ar'
+          ? 'تم التبديل إلى دور المتداول (USER): تم تقييد مسارات المشرف.'
+          : 'Switched to Trader (USER): Administrator routes and controls restricted.',
+        'info'
+      );
     }
   };
 
@@ -530,18 +639,33 @@ export default function App() {
           setIsAuthenticated(true);
           setCurrentView('DASHBOARD');
         }}
-        onDirectLogin={(email) => {
-          const role = email.includes('admin') ? 'ADMIN' : 'USER';
-          setUser({
-            id: email.includes('admin') ? 'usr_admin' : 'usr_trader',
-            email,
-            name: email.includes('admin') ? 'Super Admin' : 'Pro Trader',
-            role,
-            createdAt: new Date().toISOString(),
-          });
-          setIsAuthenticated(true);
-          setCurrentView('DASHBOARD');
-          showToast(lang === 'ar' ? 'تم تسجيل الدخول بنجاح' : 'Logged in successfully', 'success');
+        onDirectLogin={async (email, password) => {
+          try {
+            const pass = password || (email.includes('admin') ? 'Admin@AI2026!' : 'Trader@AI2026!');
+            const res = await fetch('/api/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password: pass }),
+            });
+            if (res.ok) {
+              const data = await res.json();
+              setUser(data.user);
+              setAuthToken(data.token);
+              setIsAuthenticated(true);
+              setCurrentView('DASHBOARD');
+              showToast(
+                lang === 'ar'
+                  ? `مرحباً ${data.user.name} - تم تفعيل صلاحيات (${data.user.role})`
+                  : `Welcome ${data.user.name} - Logged in with (${data.user.role}) role`,
+                'success'
+              );
+            } else {
+              const err = await res.json().catch(() => ({}));
+              showToast(err.error || 'Login failed', 'error');
+            }
+          } catch {
+            showToast('Authentication network error', 'error');
+          }
         }}
       />
     );
@@ -586,6 +710,7 @@ export default function App() {
         systemHealth={systemHealth}
         notifications={notifications}
         onMarkNotificationsRead={handleMarkNotificationsRead}
+        onSwitchRole={handleSwitchRole}
       />
 
       {/* Main Content Area */}
@@ -695,21 +820,56 @@ export default function App() {
         )}
 
         {(currentView === 'ADMIN' || (currentView as string) === 'admin') && (
-          <AdminView
-            lang={lang}
-            systemHealth={systemHealth}
-            totalUsers={registeredUsers.length || 2}
-            activeBots={botRunning ? 1 : 0}
-            paperPositions={(positions || []).filter((p) => p.mode === 'PAPER').length}
-            livePositions={(positions || []).filter((p) => p.mode === 'LIVE').length}
-            totalTradesCount={(trades || []).length}
-            users={registeredUsers.length > 0 ? registeredUsers : [user]}
-            auditLogs={auditLogs}
-            onToggleKillSwitch={handleToggleKillSwitch}
-            onToggleLiveTrading={handleToggleLiveTradingGate}
-            onToggleRegistration={handleToggleRegistrationGate}
-            isLoading={isLoading}
-          />
+          user.role === 'ADMIN' ? (
+            <AdminView
+              lang={lang}
+              systemHealth={systemHealth}
+              totalUsers={registeredUsers.length || 2}
+              activeBots={botRunning ? 1 : 0}
+              paperPositions={(positions || []).filter((p) => p.mode === 'PAPER').length}
+              livePositions={(positions || []).filter((p) => p.mode === 'LIVE').length}
+              totalTradesCount={(trades || []).length}
+              users={registeredUsers.length > 0 ? registeredUsers : [user]}
+              auditLogs={auditLogs}
+              onToggleKillSwitch={handleToggleKillSwitch}
+              onToggleLiveTrading={handleToggleLiveTradingGate}
+              onToggleRegistration={handleToggleRegistrationGate}
+              isLoading={isLoading}
+            />
+          ) : (
+            <div className="max-w-2xl mx-auto my-12 p-8 rounded-2xl bg-slate-900/90 border border-red-500/40 shadow-2xl text-center space-y-4">
+              <div className="w-16 h-16 mx-auto rounded-2xl bg-red-500/10 border border-red-500/30 flex items-center justify-center text-red-400">
+                <ShieldAlert className="w-8 h-8" />
+              </div>
+              <div className="space-y-1">
+                <h2 className="text-xl font-bold text-slate-100">
+                  {lang === 'ar' ? 'تم رفض الوصول: يتطلب صلاحيات المشرف' : 'Access Restricted: Administrator Role Required'}
+                </h2>
+                <span className="inline-block px-2.5 py-0.5 rounded-full text-xs font-mono-num font-bold bg-red-500/20 text-red-300 border border-red-500/30">
+                  HTTP 403 Forbidden
+                </span>
+              </div>
+              <p className="text-sm text-slate-400 max-w-md mx-auto leading-relaxed">
+                {lang === 'ar'
+                  ? 'مركز التحكم الإداري (Admin Center) ومسارات الإدارة محمية برمجياً وتتطلب حساباً يحمل رتبة (ADMIN). حسابك الحالي مسجل بدور (USER).'
+                  : 'The Administrator Control Center and its endpoints are protected and require the ADMIN role. Your current account has role (USER).'}
+              </p>
+              <div className="pt-3 flex flex-wrap items-center justify-center gap-3">
+                <button
+                  onClick={() => setCurrentView('DASHBOARD')}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition-colors"
+                >
+                  {lang === 'ar' ? 'العودة إلى لوحة التداول' : 'Return to Dashboard'}
+                </button>
+                <button
+                  onClick={() => handleSwitchRole('ADMIN')}
+                  className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold shadow-lg shadow-amber-500/20 transition-transform active:scale-95"
+                >
+                  {lang === 'ar' ? 'التبديل إلى حساب المشرف (ADMIN)' : 'Switch to Super Admin (ADMIN)'}
+                </button>
+              </div>
+            </div>
+          )
         )}
 
         {(currentView === 'HEALTH_DOCS' || (currentView as string) === 'health') && (

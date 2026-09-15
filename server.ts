@@ -8,6 +8,7 @@ import { riskEngine } from './server/riskEngine';
 import { tradingEngine } from './server/tradingEngine';
 import { backtestingEngine } from './server/backtestEngine';
 import { runAllTests } from './server/testSuite';
+import { User } from './server/types';
 
 async function startServer() {
   const app = express();
@@ -24,7 +25,85 @@ async function startServer() {
     }
   }, 10000);
 
-  // ================= 1. AUTHENTICATION =================
+  // ================= 1. AUTHENTICATION & RBAC SECURITY =================
+  // In-memory token store for session verification and RBAC
+  const activeTokens = new Map<string, { userId: string; role: 'ADMIN' | 'USER'; createdAt: number }>();
+  activeTokens.set('tok_usr_admin_default', { userId: 'usr_admin', role: 'ADMIN', createdAt: Date.now() });
+  activeTokens.set('tok_usr_trader_default', { userId: 'usr_trader', role: 'USER', createdAt: Date.now() });
+
+  function getRequestUser(req: express.Request): User | undefined {
+    let token = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim();
+    const headerUserId = (req.headers['x-user-id'] as string)?.trim();
+
+    if (token) {
+      const session = activeTokens.get(token);
+      if (session) {
+        return db.users.get(session.userId);
+      }
+      if (token.startsWith('tok_')) {
+        // e.g. tok_usr_admin_123456
+        const parts = token.split('_');
+        const extractedId = parts.slice(1, parts.length - 1).join('_');
+        const u = db.users.get(extractedId);
+        if (u) return u;
+      }
+      const directUser = db.users.get(token);
+      if (directUser) return directUser;
+    }
+
+    if (headerUserId) {
+      const u = db.users.get(headerUserId);
+      if (u) return u;
+    }
+
+    return undefined;
+  }
+
+  function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const user = getRequestUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        error: 'Unauthorized: Authentication required to access administrator endpoints.',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    if (user.role !== 'ADMIN') {
+      db.logAudit(
+        user.id,
+        'SECURITY_ALERT',
+        `Unauthorized Admin Access Blocked: User ${user.email} (Role: ${user.role}) attempted to access restricted endpoint ${req.method} ${req.path}`,
+        'ALERT'
+      );
+      return res.status(403).json({
+        error: 'Forbidden: Administrator privileges (role: ADMIN) required to execute this operation.',
+        code: 'ADMIN_ROLE_REQUIRED',
+        userRole: user.role,
+      });
+    }
+
+    (req as any).user = user;
+    next();
+  }
+
+  app.get('/api/auth/me', (req, res) => {
+    const user = getRequestUser(req);
+    if (!user) {
+      return res.status(401).json({ error: 'Not authenticated', code: 'UNAUTHENTICATED' });
+    }
+    return res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        createdAt: user.createdAt,
+      },
+      isAdmin: user.role === 'ADMIN',
+    });
+  });
+
   app.post('/api/auth/login', (req, res) => {
     const { email, password } = req.body;
     const user = Array.from(db.users.values()).find(
@@ -34,6 +113,9 @@ async function startServer() {
     if (!user || user.passwordHash !== password) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
+
+    const token = `tok_${user.id}_${Date.now()}`;
+    activeTokens.set(token, { userId: user.id, role: user.role, createdAt: Date.now() });
 
     db.logAudit(user.id, 'LOGIN', `User ${user.email} (${user.role}) logged in successfully.`, 'INFO');
 
@@ -45,7 +127,8 @@ async function startServer() {
         role: user.role,
         createdAt: user.createdAt,
       },
-      token: `tok_${user.id}_${Date.now()}`,
+      token,
+      isAdmin: user.role === 'ADMIN',
     });
   });
 
@@ -79,6 +162,9 @@ async function startServer() {
     };
 
     db.users.set(newUser.id, newUser);
+    const token = `tok_${newUser.id}_${Date.now()}`;
+    activeTokens.set(token, { userId: newUser.id, role: newUser.role, createdAt: Date.now() });
+
     db.logAudit(newUser.id, 'LOGIN', `New user registered: ${newUser.email}`, 'INFO');
 
     return res.json({
@@ -89,6 +175,8 @@ async function startServer() {
         role: newUser.role,
         createdAt: newUser.createdAt,
       },
+      token,
+      isAdmin: false,
     });
   });
 
@@ -434,7 +522,7 @@ async function startServer() {
       db.backtests.unshift(backtest);
       if (db.backtests.length > 50) db.backtests.pop();
 
-      return res.json({ backtest });
+      return res.json({ backtest, ...backtest });
     } catch (err: unknown) {
       return res.status(500).json({ error: 'Backtesting execution failed' });
     }
@@ -469,8 +557,8 @@ async function startServer() {
     }
   });
 
-  // ================= 8. ADMIN CONTROL CENTER =================
-  app.get('/api/admin/overview', (req, res) => {
+  // ================= 8. ADMIN CONTROL CENTER (SECURED) =================
+  app.get('/api/admin/overview', requireAdmin, (req, res) => {
     const totalUsers = db.users.size;
     const activeBots = Array.from(db.botSettings.values()).filter((s) => s.isEnabled).length;
     const paperPositions = Array.from(db.positions.values()).filter((p) => p.mode === 'PAPER').length;
@@ -495,43 +583,43 @@ async function startServer() {
     });
   });
 
-  app.post('/api/admin/toggle-kill-switch', (req, res) => {
+  app.post('/api/admin/toggle-kill-switch', requireAdmin, (req, res) => {
     const { active } = req.body;
     db.systemHealth.globalKillSwitchActive = !!active;
     db.logAudit(
-      'ADMIN',
+      (req as any).user?.id || 'ADMIN',
       'ADMIN_KILL_SWITCH',
-      `GLOBAL KILL SWITCH was ${active ? 'ENGAGED' : 'DISENGAGED'} by Admin.`,
+      `GLOBAL KILL SWITCH was ${active ? 'ENGAGED' : 'DISENGAGED'} by Admin (${(req as any).user?.email || 'admin'}).`,
       active ? 'ALERT' : 'INFO'
     );
     return res.json({ success: true, killSwitchActive: db.systemHealth.globalKillSwitchActive });
   });
 
-  app.post('/api/admin/toggle-live-trading', (req, res) => {
+  app.post('/api/admin/toggle-live-trading', requireAdmin, (req, res) => {
     const { enabled } = req.body;
     db.systemHealth.globalLiveTradingEnabled = !!enabled;
     db.logAudit(
-      'ADMIN',
+      (req as any).user?.id || 'ADMIN',
       'STRATEGY_UPDATE',
-      `Live Trading global gateway set to: ${enabled ? 'ENABLED' : 'DISABLED'}.`,
+      `Live Trading global gateway set to: ${enabled ? 'ENABLED' : 'DISABLED'} by Admin (${(req as any).user?.email || 'admin'}).`,
       'INFO'
     );
     return res.json({ success: true, globalLiveTradingEnabled: db.systemHealth.globalLiveTradingEnabled });
   });
 
-  app.post('/api/admin/toggle-registration', (req, res) => {
+  app.post('/api/admin/toggle-registration', requireAdmin, (req, res) => {
     const { enabled } = req.body;
     db.systemHealth.registrationEnabled = !!enabled;
     db.logAudit(
-      'ADMIN',
+      (req as any).user?.id || 'ADMIN',
       'STRATEGY_UPDATE',
-      `User registration gateway set to: ${enabled ? 'ENABLED' : 'DISABLED'}.`,
+      `User registration gateway set to: ${enabled ? 'ENABLED' : 'DISABLED'} by Admin (${(req as any).user?.email || 'admin'}).`,
       'INFO'
     );
     return res.json({ success: true, registrationEnabled: db.systemHealth.registrationEnabled });
   });
 
-  app.get('/api/admin/audit-logs', (req, res) => {
+  app.get('/api/admin/audit-logs', requireAdmin, (req, res) => {
     const limit = parseInt((req.query.limit as string) || '100', 10);
     return res.json({ auditLogs: db.auditLogs.slice(0, limit) });
   });

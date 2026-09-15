@@ -2,5 +2,7 @@
   "name": "Binance AI Trading Platform",
   "description": "منصة ذكاء اصطناعي للتداول الآلي عبر Binance Spot مع محرك إدارة مخاطر واختبار استراتيجيات وتداول تجريبي وحقيقي",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
