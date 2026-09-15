@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-trading: 'IBM Plex Sans Arabic', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  body {
+    font-family: var(--font-trading);
+    background-color: #0b0e14;
+    color: #e2e8f0;
+    overflow-x: hidden;
+  }
+
+  .font-mono-num {
+    font-family: var(--font-mono);
+    font-feature-settings: 'tnum' on, 'zero' on;
+  }
+}
+
+/* Custom dark scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0f141c;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+
+/* Trading theme color accents */
+.text-bull {
+  color: #10b981;
+}
+.bg-bull {
+  background-color: #10b981;
+}
+.border-bull {
+  border-color: #10b981;
+}
+
+.text-bear {
+  color: #ef4444;
+}
+.bg-bear {
+  background-color: #ef4444;
+}
+.border-bear {
+  border-color: #ef4444;
+}
