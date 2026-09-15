@@ -15,6 +15,10 @@ import {
   AppNotification,
   SystemHealth
 } from './types';
+import { STRATEGIES, toDbStrategy } from './strategies';
+import { getSyntheticPrice } from './marketData';
+import { hashPassword } from './auth';
+import { binanceClient } from './binance';
 
 // In-Memory Database store with relational indexing and persistent memory
 class TradingDatabase {
@@ -22,6 +26,8 @@ class TradingDatabase {
   apiConnections: Map<string, ApiConnection> = new Map();
   botSettings: Map<string, BotSettings> = new Map();
   strategies: Map<string, Strategy> = new Map();
+  /** Per-strategy parameter overrides (admin-tunable), merged over defaults */
+  strategyParams: Map<string, Record<string, number | string | boolean>> = new Map();
   symbols: Map<string, MarketSymbol> = new Map();
   signals: TradingSignal[] = [];
   positions: Map<string, Position> = new Map();
@@ -44,10 +50,15 @@ class TradingDatabase {
     globalKillSwitchActive: false,
     registrationEnabled: false, // Per prompt: "Registration = Disabled في المرحلة الأولى"
     globalLiveTradingEnabled: false, // Per prompt: "Disabled افتراضيًا"
+    tradingMode: 'PAPER', // Always boot in paper mode; LIVE requires an explicit admin switch
     uptimeSeconds: 0,
     lastSuccessfulMarketUpdate: new Date().toISOString(),
     activeErrorsCount: 0,
     geminiAiAvailable: !!process.env.GEMINI_API_KEY,
+    marketDataSource: 'SIMULATED_OFFLINE',
+    lastMarketDataError: null,
+    lastLiveBinanceFetchAt: null,
+    autoTradingActive: false,
   };
 
   private startTime = Date.now();
@@ -63,7 +74,7 @@ class TradingDatabase {
       email: 'admin@trading.ai',
       name: 'Super Admin',
       role: 'ADMIN',
-      passwordHash: 'Admin@AI2026!',
+      passwordHash: hashPassword('Admin@AI2026!'),
       createdAt: new Date().toISOString(),
       isActive: true,
     };
@@ -72,68 +83,20 @@ class TradingDatabase {
       email: 'trader@trading.ai',
       name: 'Pro Trader',
       role: 'USER',
-      passwordHash: 'Trader@AI2026!',
+      passwordHash: hashPassword('Trader@AI2026!'),
       createdAt: new Date().toISOString(),
       isActive: true,
     };
     this.users.set(adminUser.id, adminUser);
     this.users.set(demoTrader.id, demoTrader);
 
-    // 2. Seed Strategies
-    const defaultStrategies: Strategy[] = [
-      {
-        id: 'strat_trend',
-        name: 'Trend Following (EMA & MACD Confluence)',
-        nameAr: 'تتبع الاتجاه (تلاقي المتوسطات المتحركة والماكد)',
-        description: 'Multi-EMA alignment (9/21/50/200) with MACD momentum confirmation for swing trading.',
-        descriptionAr: 'توافق المتوسطات المتحركة (9/21/50/200) مع تأكيد الزخم عبر MACD للتداول مع الاتجاه.',
-        category: 'TREND',
-        isActive: true,
-        parameters: { emaFast: 9, emaSlow: 21, emaTrend: 200, rsiThreshold: 50 },
-      },
-      {
-        id: 'strat_breakout',
-        name: 'Volatility Breakout & Volume Expansion',
-        nameAr: 'اختراق التقلب مع تمدد السيولة والحجم',
-        description: 'Identifies consolidation ranges and enters upon high-volume expansion outside Bollinger & ATR bands.',
-        descriptionAr: 'رصد مناطق التجميع والدخول عند اختراق نطاق البولينجر مع انفجار في حجم التداول.',
-        category: 'BREAKOUT',
-        isActive: true,
-        parameters: { volumeMultiplier: 1.8, atrLookback: 14 },
-      },
-      {
-        id: 'strat_pullback',
-        name: 'Fibonacci Pullback & Liquidity Sweeps',
-        nameAr: 'ارتداد فيبوناتشي واقتناص السيولة',
-        description: 'Enters in the direction of the dominant trend on 0.5 - 0.618 golden pocket retracements.',
-        descriptionAr: 'دخول مع الاتجاه الرئيسي عند الارتداد إلى مستويات التصحيح الذهبية 0.5 - 0.618.',
-        category: 'PULLBACK',
-        isActive: true,
-        parameters: { fibMin: 0.5, fibMax: 0.618, rsiMin: 40, rsiMax: 60 },
-      },
-      {
-        id: 'strat_momentum',
-        name: 'RSI Divergence & Momentum Surge',
-        nameAr: 'الزخم والانفراج الإيجابي/السلبي لمؤشر RSI',
-        description: 'Captures accelerated impulse waves when price action confirms RSI momentum crossovers.',
-        descriptionAr: 'اقتناص موجات الاندفاع السريعة عند تأكيد مؤشر القوة النسبية لانعكاس الزخم.',
-        category: 'MOMENTUM',
-        isActive: true,
-        parameters: { rsiOverbought: 70, rsiOversold: 30 },
-      },
-      {
-        id: 'strat_fractal',
-        name: 'Fractal & Multi-Timeframe Market Structure',
-        nameAr: 'هندسة الفركتال وبنية السوق متعددة الأطر',
-        description: 'Identifies Swing Highs/Lows, Order Blocks, and self-similar market structure breaks.',
-        descriptionAr: 'تحديد قمم وقيعان السوينغ (Swing High/Low) والكتل السعرية مع كسر بنية السوق (BOS).',
-        category: 'FRACTAL',
-        isActive: true,
-        parameters: { swingLookback: 5, requireConfirmation: true },
-      },
-    ];
-
-    defaultStrategies.forEach((s) => this.strategies.set(s.id, s));
+    // 2. Seed Strategies — sourced from the strategy registry so the UI, the
+    //    live bot and the backtester can never drift apart again.
+    STRATEGIES.forEach((def) => {
+      const s = toDbStrategy(def) as Strategy;
+      this.strategies.set(s.id, s);
+      this.strategyParams.set(s.id, { ...def.defaultParams });
+    });
 
     // 3. Seed Symbols
     const defaultSymbols: MarketSymbol[] = [
@@ -232,8 +195,14 @@ class TradingDatabase {
       isEnabled: true,
       mode: 'PAPER', // Default Paper
       selectedSymbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
-      activeStrategies: ['strat_trend', 'strat_fractal', 'strat_pullback'],
-      primaryTimeframe: '15m',
+      // Only the strategies that passed EVERY validation filter (positive net
+      // return, PF > 1.05, out-of-sample walk-forward, and parameter robustness)
+      // in scripts/validate.ts are enabled by default. See docs/BOT_AUDIT.md.
+      activeStrategies: ['strat_turtle', 'strat_dual_momentum'],
+      // 4h is the timeframe both validated strategies were designed for. Running
+      // a daily-bar system on 15m multiplies trade count (and fee drag) with no
+      // added edge — measured: Turtle went from +9.45% on 4h to -4.52% on 1h.
+      primaryTimeframe: '4h',
       secondaryTimeframes: ['1h', '4h', '1d'],
       riskPerTradePercent: 1.0,
       maxDailyLossUsd: 150,
@@ -243,8 +212,10 @@ class TradingDatabase {
       stopLossPercent: 1.8,
       takeProfitType: 'MULTI_TARGET',
       takeProfitRatio: 2.5,
-      minAiConfidence: 75,
-      aiAnalysisIntervalSec: 30,
+      minAiConfidence: 62,
+      aiAnalysisIntervalSec: 60,
+      maxConsecutiveLosses: 4,
+      maxTotalExposurePercent: 80,
       circuitBreakerActive: false,
       updatedAt: new Date().toISOString(),
     };
@@ -275,26 +246,41 @@ class TradingDatabase {
     };
     this.apiConnections.set(demoTrader.id, defaultConnection);
 
-    // 6. Pre-seed Sample Paper Positions
+    // 6. Pre-seed one sample paper position.
+    //    Entry price is derived from the SAME simulated feed the engine reads, so
+    //    the demo position does not show an instant fantasy +23% PnL.
+    const seedBtc = getSyntheticPrice('BTCUSDT');
+    const seedEntry = Math.round(seedBtc * 0.985 * 100) / 100;
+    const seedQty = 0.012;
+    const seedAtr = Math.round(seedEntry * 0.018 * 100) / 100;
     const samplePosition1: Position = {
       id: 'pos_1',
       userId: demoTrader.id,
       symbol: 'BTCUSDT',
       side: 'BUY',
       mode: 'PAPER',
-      quantity: 0.05,
-      entryPrice: 76500.0,
-      currentPrice: 76800.0,
-      stopLoss: 73500.0,
-      takeProfit1: 81000.0,
-      takeProfit2: 83500.0,
+      quantity: seedQty,
+      entryPrice: seedEntry,
+      currentPrice: seedBtc,
+      stopLoss: Math.round((seedEntry - 2 * seedAtr) * 100) / 100,
+      takeProfit1: Math.round((seedEntry + 2 * (seedEntry - (seedEntry - 2 * seedAtr))) * 100) / 100,
+      takeProfit2: Math.round((seedEntry + 3 * (seedEntry - (seedEntry - 2 * seedAtr))) * 100) / 100,
       trailingStopActive: true,
-      unrealizedPnlUsd: (76800 - 76500) * 0.05,
-      unrealizedPnlPercent: ((76800 - 76500) / 76500) * 100,
+      unrealizedPnlUsd: Math.round((seedBtc - seedEntry) * seedQty * 100) / 100,
+      unrealizedPnlPercent: Math.round(((seedBtc - seedEntry) / seedEntry) * 10000) / 100,
       openedAt: new Date(Date.now() - 3600000 * 4).toISOString(),
-      strategy: 'Trend Following & Market Structure',
-      aiConfidence: 84,
-      entryReason: 'Bullish 4H/1H alignment + Swing Low support rebound + Volume confirmation',
+      strategy: 'Supertrend (10,3) + EMA200 filter',
+      strategyId: 'strat_supertrend',
+      exitMode: 'SIGNAL',
+      aiConfidence: 68,
+      entryReason: 'Supertrend flipped bullish with price above EMA200 (demo position seeded at startup).',
+      entryNotional: Math.round(seedEntry * seedQty * 100) / 100,
+      entryFeePaid: Math.round(seedEntry * seedQty * 0.001 * 100) / 100,
+      highestSinceEntry: seedBtc,
+      lowestSinceEntry: seedEntry,
+      takeProfit1Filled: false,
+      stopLossAtBreakeven: false,
+      dataSource: 'SIMULATED_OFFLINE',
     };
     this.positions.set(samplePosition1.id, samplePosition1);
 
@@ -412,6 +398,13 @@ class TradingDatabase {
   getHealth(): SystemHealth {
     this.systemHealth.uptimeSeconds = Math.floor((Date.now() - this.startTime) / 1000);
     this.systemHealth.lastSuccessfulMarketUpdate = new Date().toISOString();
+    // Report honestly whether prices are real Binance data or the offline simulation
+    this.systemHealth.marketDataSource = binanceClient.lastDataSource;
+    this.systemHealth.lastMarketDataError = binanceClient.lastFetchError;
+    this.systemHealth.lastLiveBinanceFetchAt = binanceClient.lastLiveFetchAt
+      ? new Date(binanceClient.lastLiveFetchAt).toISOString()
+      : null;
+    this.systemHealth.binanceApiStatus = binanceClient.lastDataSource === 'LIVE_BINANCE' ? 'CONNECTED' : 'DISCONNECTED';
     return this.systemHealth;
   }
 }

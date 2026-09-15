@@ -446,6 +446,8 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
                     ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
                     : wfResult.robustnessVerdict === 'MODERATE'
                     ? 'bg-amber-500/10 border-amber-500/40 text-amber-300'
+                    : wfResult.robustnessVerdict === 'INSUFFICIENT_DATA'
+                    ? 'bg-sky-500/10 border-sky-500/40 text-sky-300'
                     : 'bg-red-500/10 border-red-500/40 text-red-300'
                 }`}
               >
@@ -453,19 +455,37 @@ export const BacktestingView: React.FC<BacktestingViewProps> = ({
                   <CheckCircle2 className="w-5 h-5" />
                   <div>
                     <span className="text-xs font-bold uppercase tracking-wider block">
-                      Robustness Verdict: {wfResult.robustnessVerdict}
+                      {lang === 'ar' ? 'حكم المتانة: ' : 'Robustness Verdict: '}
+                      {wfResult.robustnessVerdict === 'INSUFFICIENT_DATA'
+                        ? (lang === 'ar' ? 'بيانات غير كافية' : 'INSUFFICIENT DATA')
+                        : wfResult.robustnessVerdict === 'ROBUST'
+                        ? (lang === 'ar' ? 'قوية' : 'ROBUST')
+                        : wfResult.robustnessVerdict === 'MODERATE'
+                        ? (lang === 'ar' ? 'متوسطة' : 'MODERATE')
+                        : (lang === 'ar' ? 'مُفرطة التخصيص' : 'OVERFITTED')}
                     </span>
                     <span className="text-xs text-slate-300">
-                      Efficiency Ratio (Out-of-sample Sharpe / In-sample Sharpe): {wfResult.efficiencyRatio}
+                      {lang === 'ar'
+                        ? `نسبة الكفاءة (شارب خارج العينة / داخل العينة): ${wfResult.efficiencyRatio}`
+                        : `Efficiency Ratio (Out-of-sample Sharpe / In-sample Sharpe): ${wfResult.efficiencyRatio}`}
                     </span>
                   </div>
                 </div>
-                <div className="text-xs font-bold font-mono-num">
+                <div className="text-xs font-bold font-mono-num text-end">
                   {wfResult.robustnessVerdict === 'ROBUST'
-                    ? 'Low Overfitting Risk'
+                    ? (lang === 'ar' ? 'خطر تخصيص منخفض' : 'Low Overfitting Risk')
                     : wfResult.robustnessVerdict === 'MODERATE'
-                    ? 'Moderate Generalization'
-                    : 'Severe Overfitting Caution'}
+                    ? (lang === 'ar' ? 'تعميم متوسط' : 'Moderate Generalization')
+                    : wfResult.robustnessVerdict === 'INSUFFICIENT_DATA'
+                    ? (lang === 'ar' ? 'ليست دليلاً على الفشل' : 'Not Evidence Of Failure')
+                    : (lang === 'ar' ? 'تحذير تخصيص شديد' : 'Severe Overfitting Caution')}
+                  {typeof wfResult.informativeFolds === 'number' && (
+                    <span className="block font-normal text-[10px] text-slate-400 mt-1">
+                      {lang === 'ar'
+                        ? `نوافذ صالحة: ${wfResult.informativeFolds}/${wfResult.totalFolds} · خارج العينة مجمّع: ${wfResult.pooledOutOfSampleTrades ?? 0} صفقة، عامل ربح ${wfResult.pooledOutOfSampleProfitFactor ?? 0}`
+                        : `Informative folds: ${wfResult.informativeFolds}/${wfResult.totalFolds} · Pooled OOS: ${wfResult.pooledOutOfSampleTrades ?? 0} trades, PF ${wfResult.pooledOutOfSampleProfitFactor ?? 0}`}
+                    </span>
+                  )}
                 </div>
               </div>
 

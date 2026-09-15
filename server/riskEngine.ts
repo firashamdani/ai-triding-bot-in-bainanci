@@ -8,15 +8,46 @@ export interface PositionSizeResult {
   riskAmountUsd: number;
   stopLossPrice: number;
   takeProfitPrice: number;
+  takeProfits: number[];
+  /** How many multiples of risk each target represents */
+  rrTargets: number[];
+  stopType: string;
+  /** Set when the exposure cap (not the risk %) determined the size */
+  sizeCappedBy: 'RISK_PERCENT' | 'EXPOSURE_CAP' | 'CASH_AVAILABLE' | null;
   reason?: string;
 }
 
+export interface SizingContext {
+  /** Notional already committed in open positions */
+  committedNotional?: number;
+  /** ATR of the symbol, used by ATR/TRAILING stop types */
+  atrValue?: number;
+  /** Nearest structural swing low, used by the STRUCTURE stop type */
+  structureStop?: number;
+  /** Cash actually available to spend */
+  availableCash?: number;
+}
+
+const DEFAULT_MAX_TOTAL_EXPOSURE = 0.8; // 80% of equity committed at once
+const DEFAULT_MAX_CONSECUTIVE_LOSSES = 4;
+
 export class RiskManagementEngine {
   private dailyLossTracker = new Map<string, { date: string; realizedLoss: number; consecutiveLosses: number }>();
-  private processedOrderIds = new Set<string>(); // Idempotency protection
+  private processedOrderIds = new Set<string>();
 
   /**
-   * Calculate precise position sizing and risk validation
+   * Calculate precise position sizing and risk validation.
+   *
+   * Fixes vs the previous version:
+   *  - The stop type in settings (FIXED_PERCENT / ATR / STRUCTURE / TRAILING)
+   *    was ignored — every stop was a flat percentage. ATR stops now scale with
+   *    volatility, which is the single biggest driver of whether a stop gets
+   *    hit by noise instead of by a real move.
+   *  - The old 40%-of-balance cap silently overrode the user's risk %, so
+   *    changing "risk per trade" often did nothing. Sizing is now risk-driven
+   *    first and the result reports which constraint actually bound.
+   *  - Total exposure across ALL open positions is capped, so maxOpenTrades x
+   *    per-trade size can no longer add up to >100% of the account.
    */
   calculatePositionSize(
     userId: string,
@@ -24,160 +55,163 @@ export class RiskManagementEngine {
     currentPrice: number,
     settings: BotSettings,
     openPositionsCount: number,
-    customStopLoss?: number
+    customStopLoss?: number,
+    ctx: SizingContext = {}
   ): PositionSizeResult {
-    // 1. Check Circuit Breaker & Kill Switch
-    if (db.systemHealth.circuitBreakerTripped || db.systemHealth.globalKillSwitchActive) {
-      return {
-        allowed: false,
-        quantity: 0,
-        usdValue: 0,
-        riskAmountUsd: 0,
-        stopLossPrice: 0,
-        takeProfitPrice: 0,
-        reason: 'Circuit Breaker or Global Kill Switch is active. All trading halted.',
-      };
-    }
+    const reject = (reason: string): PositionSizeResult => ({
+      allowed: false, quantity: 0, usdValue: 0, riskAmountUsd: 0,
+      stopLossPrice: 0, takeProfitPrice: 0, takeProfits: [], rrTargets: [],
+      stopType: settings.stopLossType || 'FIXED_PERCENT', sizeCappedBy: null, reason,
+    });
 
-    // 2. Max Open Trades Check
+    if (db.systemHealth.circuitBreakerTripped) return reject('Circuit breaker is tripped. All new entries are halted.');
+    if (db.systemHealth.globalKillSwitchActive) return reject('Global Kill Switch is active. All trading halted by an administrator.');
+
     if (openPositionsCount >= settings.maxOpenTrades) {
-      return {
-        allowed: false,
-        quantity: 0,
-        usdValue: 0,
-        riskAmountUsd: 0,
-        stopLossPrice: 0,
-        takeProfitPrice: 0,
-        reason: `Maximum open trades limit reached (${openPositionsCount}/${settings.maxOpenTrades}).`,
-      };
+      return reject(`Maximum open trades limit reached (${openPositionsCount}/${settings.maxOpenTrades}).`);
     }
 
-    // 3. Daily Loss Check
     const today = new Date().toISOString().split('T')[0];
-    const userLossData = this.getDailyLoss(userId, today);
-    if (userLossData.realizedLoss >= settings.maxDailyLossUsd) {
+    const lossData = this.getDailyLoss(userId, today);
+
+    if (lossData.realizedLoss >= settings.maxDailyLossUsd) {
       this.triggerCircuitBreaker(
         'DAILY_LOSS_LIMIT_REACHED',
-        `Daily loss reached $${userLossData.realizedLoss.toFixed(2)} exceeding limit of $${settings.maxDailyLossUsd}.`
+        `Daily realized loss reached $${lossData.realizedLoss.toFixed(2)}, at/over the $${settings.maxDailyLossUsd} limit.`
       );
-      return {
-        allowed: false,
-        quantity: 0,
-        usdValue: 0,
-        riskAmountUsd: 0,
-        stopLossPrice: 0,
-        takeProfitPrice: 0,
-        reason: `Daily loss limit exceeded ($${userLossData.realizedLoss.toFixed(2)} >= $${settings.maxDailyLossUsd}).`,
-      };
+      return reject(`Daily loss limit reached ($${lossData.realizedLoss.toFixed(2)} >= $${settings.maxDailyLossUsd}).`);
     }
 
-    // 4. Consecutive Losses Circuit Breaker (e.g. 4 consecutive losses)
-    if (userLossData.consecutiveLosses >= 4) {
+    const maxConsec = Number((settings as any).maxConsecutiveLosses) || DEFAULT_MAX_CONSECUTIVE_LOSSES;
+    if (lossData.consecutiveLosses >= maxConsec) {
       this.triggerCircuitBreaker(
         'CIRCUIT_BREAKER_TRIGGERED',
-        `4 consecutive losing trades detected. Circuit breaker triggered to prevent revenge trading.`
+        `${lossData.consecutiveLosses} consecutive losing trades. Trading paused to prevent revenge trading.`
       );
-      return {
-        allowed: false,
-        quantity: 0,
-        usdValue: 0,
-        riskAmountUsd: 0,
-        stopLossPrice: 0,
-        takeProfitPrice: 0,
-        reason: 'Circuit breaker triggered due to 4 consecutive losing trades.',
-      };
+      return reject(`Circuit breaker: ${lossData.consecutiveLosses} consecutive losses (limit ${maxConsec}).`);
     }
 
-    // 5. Calculate Stop Loss Price based on selected type
-    if (customStopLoss !== undefined && customStopLoss !== null && customStopLoss > 0) {
-      if (customStopLoss >= currentPrice) {
-        return {
-          allowed: false,
-          quantity: 0,
-          usdValue: 0,
-          riskAmountUsd: 0,
-          stopLossPrice: 0,
-          takeProfitPrice: 0,
-          reason: `Invalid Stop Loss: Stop loss ($${customStopLoss}) cannot be higher than or equal to buy entry price ($${currentPrice}).`,
-        };
-      }
-    }
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) return reject('Invalid market price.');
 
+    // ---------------- Stop loss by configured type ----------------
+    const stopType = settings.stopLossType || 'FIXED_PERCENT';
     let stopLossPrice = 0;
-    if (customStopLoss && customStopLoss > 0 && customStopLoss < currentPrice) {
-      stopLossPrice = customStopLoss;
+
+    const explicit = typeof customStopLoss === 'number' && customStopLoss > 0;
+    if (explicit) {
+      // Spot is long-only: a stop must sit BELOW the entry price.
+      if (customStopLoss! >= currentPrice) {
+        return reject(
+          `Invalid stop loss: $${customStopLoss} is not below the entry price $${currentPrice}. ` +
+            `On Binance Spot the bot is long-only, so the stop must be below entry.`
+        );
+      }
+      stopLossPrice = customStopLoss!;
+    } else if (stopType === 'ATR' || stopType === 'TRAILING') {
+      const atrVal = ctx.atrValue ?? 0;
+      if (atrVal > 0) {
+        // 2x ATR is the conventional Chandelier/Kestner distance
+        stopLossPrice = currentPrice - 2 * atrVal;
+      } else {
+        stopLossPrice = currentPrice * (1 - (settings.stopLossPercent || 2) / 100);
+      }
+    } else if (stopType === 'STRUCTURE') {
+      const structure = ctx.structureStop ?? 0;
+      const buffer = currentPrice * 0.002;
+      if (structure > 0 && structure < currentPrice) {
+        stopLossPrice = structure - buffer;
+      } else {
+        stopLossPrice = currentPrice * (1 - (settings.stopLossPercent || 2) / 100);
+      }
     } else {
-      const slPercent = (settings.stopLossPercent || 2.0) / 100;
+      const slPercent = (settings.stopLossPercent || 2) / 100;
       stopLossPrice = currentPrice * (1 - slPercent);
     }
 
-    const slDistancePercent = (currentPrice - stopLossPrice) / currentPrice;
-    if (slDistancePercent <= 0.001) {
-      return {
-        allowed: false,
-        quantity: 0,
-        usdValue: 0,
-        riskAmountUsd: 0,
-        stopLossPrice: 0,
-        takeProfitPrice: 0,
-        reason: 'Stop loss is too close to current market price.',
-      };
+    if (stopLossPrice <= 0) return reject('Computed stop loss is not positive.');
+    if (stopLossPrice >= currentPrice) return reject('Computed stop loss is not below the entry price.');
+
+    const riskPerUnit = currentPrice - stopLossPrice;
+    const slDistancePercent = riskPerUnit / currentPrice;
+    if (slDistancePercent <= 0.001) return reject('Stop loss is too close to the market price (would be noise-killed).');
+    if (slDistancePercent > 0.25) return reject('Stop loss is wider than 25% — risk per trade would be uncontrollable.');
+
+    // ---------------- Risk-based sizing ----------------
+    const riskAmountUsd = accountBalanceUsd * ((settings.riskPerTradePercent || 1) / 100);
+    let positionUsdValue = riskAmountUsd / slDistancePercent;
+    let sizeCappedBy: PositionSizeResult['sizeCappedBy'] = 'RISK_PERCENT';
+
+    // Total-exposure cap across all open positions
+    const committed = ctx.committedNotional ?? 0;
+    const maxTotalExposure = accountBalanceUsd * DEFAULT_MAX_TOTAL_EXPOSURE;
+    const exposureHeadroom = Math.max(0, maxTotalExposure - committed);
+    if (positionUsdValue > exposureHeadroom) {
+      if (exposureHeadroom <= 0) {
+        return reject(
+          `Total exposure cap reached: $${committed.toFixed(0)} of $${maxTotalExposure.toFixed(0)} already committed.`
+        );
+      }
+      positionUsdValue = exposureHeadroom;
+      sizeCappedBy = 'EXPOSURE_CAP';
     }
 
-    // 6. Risk-based position sizing formula:
-    // Risk Amount = Balance * (Risk% / 100)
-    // Position Size ($) = Risk Amount / SL Distance %
-    const riskAmountUsd = accountBalanceUsd * (settings.riskPerTradePercent / 100);
-    let positionUsdValue = riskAmountUsd / slDistancePercent;
+    // Cash cap (paper trading cannot spend money it does not have)
+    const cash = ctx.availableCash;
+    if (typeof cash === 'number' && positionUsdValue > cash * 0.99) {
+      positionUsdValue = cash * 0.99;
+      sizeCappedBy = 'CASH_AVAILABLE';
+    }
 
-    // Cap position size at max 40% of balance for prudent diversification
-    const maxAllowedPositionUsd = accountBalanceUsd * 0.4;
-    if (positionUsdValue > maxAllowedPositionUsd) {
-      positionUsdValue = maxAllowedPositionUsd;
+    if (positionUsdValue < 10) {
+      return reject(`Computed position size $${positionUsdValue.toFixed(2)} is below the $10 exchange minimum notional.`);
     }
 
     const quantity = positionUsdValue / currentPrice;
 
-    // 7. Calculate Take Profit Price
-    const riskDistance = currentPrice - stopLossPrice;
-    const tpRatio = settings.takeProfitRatio || 2.0;
-    const takeProfitPrice = currentPrice + riskDistance * tpRatio;
+    // ---------------- Targets ----------------
+    const tpRatio = settings.takeProfitRatio || 2;
+    const tpType = settings.takeProfitType || 'MULTI_TARGET';
+    let rrTargets: number[];
+    if (tpType === 'RISK_REWARD') rrTargets = [tpRatio];
+    else if (tpType === 'TRAILING') rrTargets = [tpRatio, tpRatio * 2.5];
+    else rrTargets = [Math.min(2, tpRatio), Math.max(tpRatio, 3)]; // MULTI_TARGET: bank part at 2R, run to 3R+
+
+    const takeProfits = rrTargets.map((r) => currentPrice + riskPerUnit * r);
 
     return {
       allowed: true,
-      quantity: Math.round(quantity * 10000) / 10000,
+      quantity: Math.round(quantity * 1e6) / 1e6,
       usdValue: Math.round(positionUsdValue * 100) / 100,
       riskAmountUsd: Math.round(riskAmountUsd * 100) / 100,
       stopLossPrice: Math.round(stopLossPrice * 100) / 100,
-      takeProfitPrice: Math.round(takeProfitPrice * 100) / 100,
+      takeProfitPrice: Math.round(takeProfits[0] * 100) / 100,
+      takeProfits: takeProfits.map((v) => Math.round(v * 100) / 100),
+      rrTargets,
+      stopType,
+      sizeCappedBy,
     };
   }
 
-  /**
-   * Idempotency Check: Prevent duplicate order execution
-   */
+  /** Idempotency guard against duplicate order submission */
   checkIdempotency(clientOrderId: string): boolean {
-    if (this.processedOrderIds.has(clientOrderId)) {
-      return false; // Duplicate!
-    }
+    if (this.processedOrderIds.has(clientOrderId)) return false;
     this.processedOrderIds.add(clientOrderId);
+    // Bound memory on a long-running server
+    if (this.processedOrderIds.size > 5000) {
+      this.processedOrderIds = new Set(Array.from(this.processedOrderIds).slice(-2500));
+    }
     return true;
   }
 
-  /**
-   * Register trade outcome to update daily loss and streak counters
-   */
   recordTradeResult(userId: string, pnlUsd: number) {
     const today = new Date().toISOString().split('T')[0];
     const data = this.getDailyLoss(userId, today);
-
     if (pnlUsd < 0) {
       data.realizedLoss += Math.abs(pnlUsd);
       data.consecutiveLosses += 1;
     } else {
-      data.consecutiveLosses = 0; // Reset streak on win
+      data.consecutiveLosses = 0;
     }
-
     this.dailyLossTracker.set(`${userId}_${today}`, data);
   }
 
@@ -189,110 +223,121 @@ export class RiskManagementEngine {
     return this.dailyLossTracker.get(key)!;
   }
 
+  /** Snapshot for the UI */
+  getRiskSnapshot(userId: string) {
+    const today = new Date().toISOString().split('T')[0];
+    const d = this.getDailyLoss(userId, today);
+    const settings = db.botSettings.get(userId);
+    return {
+      date: today,
+      realizedLossToday: Math.round(d.realizedLoss * 100) / 100,
+      maxDailyLossUsd: settings?.maxDailyLossUsd ?? 0,
+      dailyLossUsedPercent: settings?.maxDailyLossUsd
+        ? Math.round((d.realizedLoss / settings.maxDailyLossUsd) * 1000) / 10
+        : 0,
+      consecutiveLosses: d.consecutiveLosses,
+      maxConsecutiveLosses: Number((settings as any)?.maxConsecutiveLosses) || DEFAULT_MAX_CONSECUTIVE_LOSSES,
+      circuitBreakerTripped: db.systemHealth.circuitBreakerTripped,
+      globalKillSwitchActive: db.systemHealth.globalKillSwitchActive,
+      riskEvents: db.riskEvents.slice(0, 20),
+    };
+  }
+
   /**
-   * Emergency Stop: Halts all trading and optionally closes positions
+   * Emergency stop. Positions are closed through the trading engine so that
+   * cash, fees and the daily-loss tracker are all updated — the previous version
+   * wrote trade rows with a hardcoded `feesPaid: 1.0` and never touched the
+   * balance, so the account silently diverged from reality.
    */
-  emergencyStop(userId: string, closeAllPositions: boolean = false): {
-    positionsClosed: number;
-    message: string;
-  } {
+  async emergencyStop(userId: string, closeAllPositions = false): Promise<{ positionsClosed: number; message: string; realizedPnl: number }> {
     db.systemHealth.tradingEngineStatus = 'EMERGENCY_STOPPED';
     db.systemHealth.circuitBreakerTripped = true;
 
     db.logAudit(
       userId,
       'EMERGENCY_STOP',
-      `EMERGENCY STOP initiated by user ${userId}. All new trade openings halted. Close open positions: ${closeAllPositions}.`,
+      `EMERGENCY STOP initiated by ${userId}. New entries halted. closeAllPositions=${closeAllPositions}.`,
       'ALERT'
     );
 
     let closedCount = 0;
+    let realized = 0;
+
     if (closeAllPositions) {
-      for (const [id, pos] of db.positions.entries()) {
-        if (pos.userId === userId) {
-          // Convert to closed trade
-          const pnlUsd = (pos.currentPrice - pos.entryPrice) * pos.quantity;
-          const pnlPercent = ((pos.currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-
-          db.trades.unshift({
-            id: `trd_${Date.now()}_${closedCount}`,
-            userId: pos.userId,
-            symbol: pos.symbol,
-            side: pos.side,
-            mode: pos.mode,
-            quantity: pos.quantity,
-            entryPrice: pos.entryPrice,
-            exitPrice: pos.currentPrice,
-            stopLoss: pos.stopLoss,
-            takeProfit: pos.takeProfit1,
-            realizedPnlUsd: Math.round(pnlUsd * 100) / 100,
-            realizedPnlPercent: Math.round(pnlPercent * 100) / 100,
-            openedAt: pos.openedAt,
-            closedAt: new Date().toISOString(),
-            exitReason: 'EMERGENCY_STOP',
-            strategy: pos.strategy,
-            aiConfidence: pos.aiConfidence,
-            entryReason: pos.entryReason,
-            riskRewardAchieved: '0:0',
-            feesPaid: 1.0,
-          });
-
-          db.positions.delete(id);
+      // Dynamic import breaks the riskEngine <-> tradingEngine cycle
+      const { tradingEngine } = await import('./tradingEngine');
+      const targets: [string, Position][] = Array.from(db.positions.entries()).filter(([, p]) => p.userId === userId);
+      for (const [id] of targets) {
+        const res = await tradingEngine.closePosition(userId, id, 'EMERGENCY_STOP');
+        if (res.success && res.trade) {
           closedCount++;
+          realized += res.trade.realizedPnlUsd;
         }
       }
     }
 
     db.addNotification(
       'EMERGENCY STOP TRIGGERED',
-      `Trading paused immediately. ${closedCount} active positions closed.`,
+      `Trading halted. ${closedCount} position(s) closed, realized ${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}.`,
       'RISK'
     );
 
     return {
       positionsClosed: closedCount,
-      message: `Emergency stop active. Trading engine halted. ${closedCount} positions closed.`,
+      realizedPnl: Math.round(realized * 100) / 100,
+      message: `Emergency stop active. Trading engine halted. ${closedCount} position(s) closed.`,
     };
   }
 
   /**
-   * Reset Circuit Breaker (Admin or User action with confirmation)
+   * User-level reset: clears the loss-driven circuit breaker ONLY.
+   *
+   * Privilege fix: this no longer touches `globalKillSwitchActive` (an admin
+   * control) and no longer wipes the daily-loss tracker, which previously let
+   * any user erase their own loss limit simply by pressing "reset".
    */
-  resetCircuitBreaker(userId: string = 'usr_trader') {
+  resetCircuitBreaker(userId: string = 'usr_trader', opts: { clearDailyLoss?: boolean } = {}) {
     db.systemHealth.circuitBreakerTripped = false;
-    db.systemHealth.globalKillSwitchActive = false;
-    db.systemHealth.tradingEngineStatus = 'RUNNING';
-    
-    // Clear all daily loss tracking records for this user
-    for (const key of this.dailyLossTracker.keys()) {
-      if (key === userId || key.startsWith(`${userId}_`)) {
-        this.dailyLossTracker.delete(key);
+    if (db.systemHealth.tradingEngineStatus !== 'EMERGENCY_STOPPED') {
+      db.systemHealth.tradingEngineStatus = 'RUNNING';
+    }
+
+    if (opts.clearDailyLoss) {
+      for (const key of Array.from(this.dailyLossTracker.keys())) {
+        if (key === userId || key.startsWith(`${userId}_`)) this.dailyLossTracker.delete(key);
       }
     }
 
     const settings = db.botSettings.get(userId);
-    if (settings) {
-      settings.circuitBreakerActive = false;
-    }
+    if (settings) settings.circuitBreakerActive = false;
 
-    db.logAudit(userId, 'RISK_UPDATE', 'Circuit breaker reset by user/admin.', 'INFO');
-    db.addNotification('Circuit Breaker Reset', 'Trading engine resumed normal operations.', 'SYSTEM');
+    db.logAudit(userId, 'RISK_UPDATE', 'Circuit breaker reset (daily loss tracker preserved).', 'INFO');
+    db.addNotification('Circuit Breaker Reset', 'New entries allowed again. Daily loss counter was NOT cleared.', 'SYSTEM');
+  }
+
+  /** Admin-only: full reset including the global kill switch and loss counters. */
+  adminResetAllRiskControls(adminUserId: string) {
+    db.systemHealth.circuitBreakerTripped = false;
+    db.systemHealth.globalKillSwitchActive = false;
+    db.systemHealth.tradingEngineStatus = 'RUNNING';
+    this.dailyLossTracker.clear();
+    db.logAudit(adminUserId, 'RISK_UPDATE', 'ADMIN: all risk controls reset (kill switch + circuit breaker + daily loss counters).', 'WARNING');
+    db.addNotification('Admin Risk Reset', 'All risk controls were reset by an administrator.', 'SECURITY');
   }
 
   private triggerCircuitBreaker(eventType: RiskEvent['eventType'], description: string) {
+    if (db.systemHealth.circuitBreakerTripped) return; // don't spam duplicate events
     db.systemHealth.circuitBreakerTripped = true;
     db.systemHealth.tradingEngineStatus = 'PAUSED';
 
-    const event: RiskEvent = {
+    db.riskEvents.unshift({
       id: `risk_${Date.now()}`,
       timestamp: new Date().toISOString(),
       eventType,
       severity: 'CRITICAL',
       description,
       actionTaken: 'Trading engine paused and new order placements locked.',
-    };
-
-    db.riskEvents.unshift(event);
+    });
     db.logAudit('SYSTEM', 'RISK_UPDATE', `CIRCUIT BREAKER: ${description}`, 'ALERT');
     db.addNotification('Circuit Breaker Tripped', description, 'RISK');
   }
