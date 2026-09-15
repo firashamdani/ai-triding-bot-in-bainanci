@@ -18,6 +18,34 @@ import {
 import { STRATEGIES, toDbStrategy } from './strategies';
 import { getSyntheticPrice } from './marketData';
 import { hashPassword } from './auth';
+
+/**
+ * Seeded demo credentials.
+ *
+ * They were hardcoded literals, which meant the admin password was readable out of
+ * the committed source and identical on every deployment. They now come from the
+ * environment. The literals remain only as a development fallback, and using them
+ * in production prints a loud warning at boot.
+ */
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL ?? 'admin@trading.ai';
+const TRADER_EMAIL = process.env.TRADER_EMAIL ?? 'trader@trading.ai';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? 'Admin@AI2026!';
+const TRADER_PASSWORD = process.env.TRADER_PASSWORD ?? 'Trader@AI2026!';
+
+export const usingDefaultCredentials =
+  !process.env.ADMIN_PASSWORD || !process.env.TRADER_PASSWORD;
+
+if (process.env.NODE_ENV === 'production' && usingDefaultCredentials) {
+  console.warn(
+    '\n' +
+      '============================================================================\n' +
+      '  SECURITY: running with the DEFAULT demo credentials.\n' +
+      '  ADMIN_PASSWORD / TRADER_PASSWORD are not set, so the published admin\n' +
+      '  password from the public repository still works on this deployment.\n' +
+      '  Set both environment variables before exposing this service.\n' +
+      '============================================================================\n'
+  );
+}
 import { binanceClient } from './binance';
 
 // In-Memory Database store with relational indexing and persistent memory
@@ -71,19 +99,19 @@ class TradingDatabase {
     // 1. Seed Users (Admin & Trader)
     const adminUser: User = {
       id: 'usr_admin',
-      email: 'admin@trading.ai',
+      email: ADMIN_EMAIL,
       name: 'Super Admin',
       role: 'ADMIN',
-      passwordHash: hashPassword('Admin@AI2026!'),
+      passwordHash: hashPassword(ADMIN_PASSWORD),
       createdAt: new Date().toISOString(),
       isActive: true,
     };
     const demoTrader: User = {
       id: 'usr_trader',
-      email: 'trader@trading.ai',
+      email: TRADER_EMAIL,
       name: 'Pro Trader',
       role: 'USER',
-      passwordHash: hashPassword('Trader@AI2026!'),
+      passwordHash: hashPassword(TRADER_PASSWORD),
       createdAt: new Date().toISOString(),
       isActive: true,
     };

@@ -5,6 +5,7 @@ import { tradingEngine } from './tradingEngine';
 import { db } from './db';
 import { backtestingEngine as backtestingEngineLocal } from './backtestEngine';
 import { generateHistoricalSeries } from './marketData';
+import { generateToken, hashPassword, resolveSessionUser, verifyPassword } from './auth';
 import { computePnl } from './tradingEngine';
 import { getStrategy, STRATEGIES } from './strategies';
 import type { KlineBar } from './binance';
@@ -304,6 +305,55 @@ export async function runAllTests(): Promise<FullTestSuiteSummary> {
   const snapTrades = [...db.trades];
   const snapSettings = { ...db.botSettings.get('usr_trader')! };
   const snapBalance = tradingEngine.getPaperBalance();
+
+  await t('UNIT', 'Auth: passwords are hashed and verified in constant time', () => {
+    const hash = hashPassword('S3cret!pass');
+    return (
+      hash.startsWith('scrypt$') &&
+      !hash.includes('S3cret!pass') &&
+      verifyPassword('S3cret!pass', hash) === true &&
+      verifyPassword('S3cret!pasS', hash) === false &&
+      // legacy/plaintext values must never verify
+      verifyPassword('Admin@AI2026!', 'Admin@AI2026!') === false &&
+      verifyPassword('', hash) === false
+    );
+  }, 'Plaintext passwords were stored in a field literally named passwordHash.');
+
+  await t('UNIT', 'Auth: session tokens are unpredictable and carry no user identity', () => {
+    const a = generateToken();
+    const b = generateToken();
+    return (
+      a.length === 64 &&
+      b.length === 64 &&
+      a !== b &&
+      !a.startsWith('tok_') &&
+      !a.includes('usr_admin')
+    );
+  }, 'Tokens were `tok_${userId}_${Date.now()}` — guessable and identity-bearing.');
+
+  await t('INTEGRATION', 'Auth: forged tokens, bare ids and expired sessions all resolve to nobody', () => {
+    const TTL = 8 * 60 * 60 * 1000;
+    const sessions = new Map<string, { userId: string; role: string; createdAt: number }>();
+    const real = generateToken();
+    sessions.set(real, { userId: 'usr_trader', role: 'USER', createdAt: Date.now() });
+
+    const forged = 'tok_usr_admin_x';
+    const stale = 'tok_usr_admin_default';
+
+    return (
+      // the old bypasses
+      resolveSessionUser(`Bearer ${forged}`, sessions, TTL) === undefined &&
+      resolveSessionUser(`Bearer ${stale}`, sessions, TTL) === undefined &&
+      resolveSessionUser('Bearer usr_admin', sessions, TTL) === undefined &&
+      resolveSessionUser(undefined, sessions, TTL) === undefined &&
+      resolveSessionUser('', sessions, TTL) === undefined &&
+      // a genuine session still works
+      resolveSessionUser(`Bearer ${real}`, sessions, TTL) === 'usr_trader' &&
+      // and it expires
+      resolveSessionUser(`Bearer ${real}`, sessions, TTL, Date.now() + TTL + 1000) === undefined &&
+      sessions.has(real) === false
+    );
+  }, 'Bearer tok_usr_admin_x used to return full ADMIN with no credentials.');
 
   await t('UNIT', 'Market data: synthetic feed is persistent between calls', async () => {
     const a = await binanceClient.getKlines('BTCUSDT', '15m', 50);
