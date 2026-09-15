@@ -57,6 +57,10 @@ export interface BotSettings {
   minAiConfidence: number; // e.g. 75%
   aiAnalysisIntervalSec: number; // e.g. 30s
   circuitBreakerActive: boolean;
+  /** Stop trading after this many consecutive losses (circuit breaker) */
+  maxConsecutiveLosses?: number;
+  /** Cap on total committed notional as a % of equity across all open positions */
+  maxTotalExposurePercent?: number;
   updatedAt: string;
 }
 
@@ -68,6 +72,12 @@ export interface Strategy {
   descriptionAr: string;
   category: 'TREND' | 'BREAKOUT' | 'PULLBACK' | 'MOMENTUM' | 'MEAN_REVERSION' | 'FRACTAL';
   isActive: boolean;
+  /** Where the strategy comes from (paper/book/system), shown in the UI */
+  reference?: string;
+  /** TP_SL = fixed targets; SIGNAL = strategy decides the exit */
+  exitMode?: 'TP_SL' | 'SIGNAL';
+  /** Timeframes the system was designed for — using the wrong one inflates fee drag */
+  recommendedTimeframes?: string[];
   parameters: Record<string, number | string | boolean>;
 }
 
@@ -124,6 +134,14 @@ export interface AiPrediction {
   suggestedTp3: number;
   riskRewardRatio: string;
   actualOutcome?: 'PROFIT' | 'LOSS' | 'PENDING';
+  /** Independent strategies that also signalled long on this bar */
+  consensus?: {
+    fired: { strategyId: string; name: string; confidence: number; reason: string }[];
+    evaluated: number;
+    agreement: number;
+  };
+  /** Binance Spot cannot short: SELL means "be flat", never "open a short" */
+  longOnly?: boolean;
   actualPnlPercent?: number;
 }
 
@@ -162,6 +180,15 @@ export interface Position {
   strategy: string;
   aiConfidence: number;
   entryReason: string;
+  strategyId?: string;
+  exitMode?: 'TP_SL' | 'SIGNAL';
+  entryNotional?: number;
+  entryFeePaid?: number;
+  highestSinceEntry?: number;
+  lowestSinceEntry?: number;
+  takeProfit1Filled?: boolean;
+  stopLossAtBreakeven?: boolean;
+  dataSource?: 'LIVE_BINANCE' | 'SIMULATED_OFFLINE';
 }
 
 export interface Trade {
@@ -179,12 +206,27 @@ export interface Trade {
   realizedPnlPercent: number;
   openedAt: string;
   closedAt: string;
-  exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'TRAILING_STOP' | 'EMERGENCY_STOP' | 'MANUAL_CLOSE' | 'CIRCUIT_BREAKER';
+  exitReason:
+    | 'TAKE_PROFIT'
+    | 'TAKE_PROFIT_1'
+    | 'TAKE_PROFIT_2'
+    | 'STOP_LOSS'
+    | 'BREAKEVEN_STOP'
+    | 'TRAILING_STOP'
+    | 'SIGNAL_EXIT'
+    | 'EMERGENCY_STOP'
+    | 'MANUAL_CLOSE'
+    | 'CIRCUIT_BREAKER'
+    | 'BACKTEST_END_CLOSE';
   strategy: string;
   aiConfidence: number;
   entryReason: string;
   riskRewardAchieved: string;
   feesPaid: number;
+  /** True for rows seeded at startup to populate the demo UI */
+  isDemoSeed?: boolean;
+  isPartialClose?: boolean;
+  holdingMs?: number;
 }
 
 export interface Order {
@@ -228,11 +270,28 @@ export interface Backtest {
   netReturnPercent: number; // %
   maxDrawdownPercent: number; // %
   profitFactor: number;
+  grossProfit?: number;
+  grossLoss?: number;
+  /** True when every trade won — profitFactor is then a sentinel, not a ratio */
+  hasNoLosingTrades?: boolean;
   sharpeRatio: number;
   averageTradeProfit: number;
   averageTradeLoss: number;
   largestWin: number;
   largestLoss: number;
+  strategyName?: string;
+  maxDrawdownUsd?: number;
+  sortinoRatio?: number;
+  expectancyPerTrade?: number;
+  averageRMultiple?: number;
+  averageHoldingBars?: number;
+  tradesPerMonth?: number;
+  timeInMarketPercent?: number;
+  exitBreakdown?: Record<string, number>;
+  totalFeesPaid?: number;
+  feeDragPercent?: number;
+  dataQuality?: 'LIVE_BINANCE' | 'SIMULATED_OFFLINE' | 'CACHED';
+  notes?: string[];
   createdAt: string;
   equityCurve: { time: string; equity: number }[];
   trades: {
@@ -253,7 +312,24 @@ export interface AuditLog {
   id: string;
   timestamp: string;
   userId: string;
-  action: 'LOGIN' | 'BINANCE_CONNECT' | 'BOT_START' | 'BOT_STOP' | 'STRATEGY_UPDATE' | 'RISK_UPDATE' | 'TRADE_OPEN' | 'TRADE_CLOSE' | 'EMERGENCY_STOP' | 'API_ERROR' | 'ADMIN_KILL_SWITCH' | 'SECURITY_ALERT';
+  action:
+    | 'LOGIN'
+    | 'LOGOUT'
+    | 'BINANCE_CONNECT'
+    | 'BOT_START'
+    | 'BOT_STOP'
+    | 'STRATEGY_UPDATE'
+    | 'RISK_UPDATE'
+    | 'TRADE_OPEN'
+    | 'TRADE_CLOSE'
+    | 'ORDER_REJECTED'
+    | 'AUTO_TRADE_CYCLE'
+    | 'EMERGENCY_STOP'
+    | 'API_ERROR'
+    | 'ADMIN_KILL_SWITCH'
+    | 'SECURITY_ALERT'
+    | 'BOT_TOGGLE'
+    | 'TRADING_MODE_CHANGE';
   details: string;
   ipAddress?: string;
   severity: 'INFO' | 'WARNING' | 'ALERT';
@@ -278,8 +354,16 @@ export interface SystemHealth {
   globalKillSwitchActive: boolean;
   registrationEnabled: boolean;
   globalLiveTradingEnabled: boolean;
+  /** Global order-routing mode. The UI's PAPER/LIVE switch had no server-side
+   *  counterpart at all, so it never persisted across reloads. */
+  tradingMode: 'PAPER' | 'LIVE';
   uptimeSeconds: number;
   lastSuccessfulMarketUpdate: string;
   activeErrorsCount: number;
   geminiAiAvailable: boolean;
+  lastAutoCycleAt?: string;
+  autoTradingActive?: boolean;
+  marketDataSource?: 'LIVE_BINANCE' | 'SIMULATED_OFFLINE';
+  lastMarketDataError?: string | null;
+  lastLiveBinanceFetchAt?: string | null;
 }

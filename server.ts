@@ -1,4 +1,5 @@
 import express from 'express';
+import http from 'http';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db';
@@ -9,54 +10,60 @@ import { tradingEngine } from './server/tradingEngine';
 import { backtestingEngine } from './server/backtestEngine';
 import { runAllTests } from './server/testSuite';
 import { User } from './server/types';
+import { generateToken, hashPassword, verifyPassword } from './server/auth';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json());
 
-  // Background ticker loop to keep paper trading positions updated
-  setInterval(async () => {
-    try {
-      await tradingEngine.updatePositionsWithMarketPrices();
-    } catch {
-      // Ignore background loop errors
-    }
-  }, 10000);
+  // Background loops: position management AND the autonomous trading cycle.
+  // (Previously only position management existed — the bot never opened trades
+  // on its own, so every bot setting was dead configuration.)
+  tradingEngine.startBackgroundLoops(10000, 15000);
 
   // ================= 1. AUTHENTICATION & RBAC SECURITY =================
   // In-memory token store for session verification and RBAC
   const activeTokens = new Map<string, { userId: string; role: 'ADMIN' | 'USER'; createdAt: number }>();
-  activeTokens.set('tok_usr_admin_default', { userId: 'usr_admin', role: 'ADMIN', createdAt: Date.now() });
-  activeTokens.set('tok_usr_trader_default', { userId: 'usr_trader', role: 'USER', createdAt: Date.now() });
+  const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8h; sessions previously never expired
+  /**
+   * Pre-authenticated demo sessions.
+   *
+   * These token strings are hardcoded in src/App.tsx, i.e. public in the repo, so
+   * in production they would be an unauthenticated ADMIN backdoor. They are
+   * registered only outside production, and can be disabled explicitly with
+   * DISABLE_DEMO_SESSIONS=1. A real deployment must require the login form.
+   */
+  const demoSessionsEnabled =
+    process.env.NODE_ENV !== 'production' && process.env.DISABLE_DEMO_SESSIONS !== '1';
+  if (demoSessionsEnabled) {
+    activeTokens.set('tok_usr_admin_default', { userId: 'usr_admin', role: 'ADMIN', createdAt: Date.now() });
+    activeTokens.set('tok_usr_trader_default', { userId: 'usr_trader', role: 'USER', createdAt: Date.now() });
+  }
 
+  /**
+   * Resolve the caller from a bearer token ONLY if a real session exists for it.
+   *
+   * The previous implementation had three ways to become any user without a
+   * password: a `tok_<userId>_<anything>` string was parsed for the id and
+   * accepted, a bare user id was accepted as a token, and an `x-user-id` header
+   * was accepted outright. All three are removed. A token now carries no identity
+   * and is meaningless unless this server issued it.
+   */
   function getRequestUser(req: express.Request): User | undefined {
-    let token = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim();
-    const headerUserId = (req.headers['x-user-id'] as string)?.trim();
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim();
+    if (!token) return undefined;
 
-    if (token) {
-      const session = activeTokens.get(token);
-      if (session) {
-        return db.users.get(session.userId);
-      }
-      if (token.startsWith('tok_')) {
-        // e.g. tok_usr_admin_123456
-        const parts = token.split('_');
-        const extractedId = parts.slice(1, parts.length - 1).join('_');
-        const u = db.users.get(extractedId);
-        if (u) return u;
-      }
-      const directUser = db.users.get(token);
-      if (directUser) return directUser;
+    const session = activeTokens.get(token);
+    if (!session) return undefined;
+
+    // Reject expired sessions rather than trusting them forever.
+    if (Date.now() - session.createdAt > SESSION_TTL_MS) {
+      activeTokens.delete(token);
+      return undefined;
     }
-
-    if (headerUserId) {
-      const u = db.users.get(headerUserId);
-      if (u) return u;
-    }
-
-    return undefined;
+    return db.users.get(session.userId);
   }
 
   function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -110,11 +117,14 @@ async function startServer() {
       (u) => u.email.toLowerCase() === email?.toLowerCase()
     );
 
-    if (!user || user.passwordHash !== password) {
+    // Constant-time hash comparison. Previously `user.passwordHash !== password`
+    // against a PLAINTEXT stored password.
+    if (!user || !verifyPassword(String(password ?? ''), user.passwordHash)) {
+      db.logAudit(user?.id ?? 'anonymous', 'LOGIN', `Failed login attempt for ${email}.`, 'WARNING');
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const token = `tok_${user.id}_${Date.now()}`;
+    const token = generateToken();
     activeTokens.set(token, { userId: user.id, role: user.role, createdAt: Date.now() });
 
     db.logAudit(user.id, 'LOGIN', `User ${user.email} (${user.role}) logged in successfully.`, 'INFO');
@@ -156,7 +166,7 @@ async function startServer() {
       email,
       name: name || email.split('@')[0],
       role: 'USER' as const,
-      passwordHash: password,
+      passwordHash: hashPassword(String(password)),
       createdAt: new Date().toISOString(),
       isActive: true,
     };
@@ -209,14 +219,23 @@ async function startServer() {
 
   // ================= 3. AI TRADING ENGINE & SCANNER =================
   app.get('/api/ai/scanner', async (req, res) => {
-    const targetSymbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT'];
+    const userId = (req.query.userId as string) || 'usr_trader';
+    const settings = db.botSettings.get(userId);
+    const targetSymbols = settings?.selectedSymbols?.length
+      ? settings.selectedSymbols
+      : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT'];
+    const strategyIds = settings?.activeStrategies?.length
+      ? settings.activeStrategies
+      : Array.from(db.strategies.keys());
     const results = [];
 
     for (const sym of targetSymbols) {
       try {
-        const klines15m = await binanceClient.getKlines(sym, '15m', 40);
-        const klines1h = await binanceClient.getKlines(sym, '1h', 40);
-        const klines4h = await binanceClient.getKlines(sym, '4h', 40);
+        // Strategies need 220+ bars (EMA200), so the old limit of 40 could never
+        // evaluate them at all.
+        const klines15m = await binanceClient.getKlines(sym, '15m', 400);
+        const klines1h = await binanceClient.getKlines(sym, '1h', 300);
+        const klines4h = await binanceClient.getKlines(sym, '4h', 300);
         const currentPrice = klines15m[klines15m.length - 1]?.close || 100;
 
         const analysis = await aiTradingEngine.analyzeSymbol(
@@ -225,7 +244,8 @@ async function startServer() {
           klines15m,
           klines1h,
           klines4h,
-          75
+          settings?.minAiConfidence ?? 62,
+          strategyIds
         );
 
         results.push({
@@ -236,24 +256,37 @@ async function startServer() {
           factors: analysis.factors,
           entryZone: analysis.factors.entryZone,
           riskRewardRatio: analysis.riskRewardRatio,
-          reasoning: analysis.reasoning.slice(0, 3),
+          reasoning: analysis.reasoning.slice(0, 4),
+          suggestedStopLoss: analysis.suggestedStopLoss,
+          suggestedTp1: analysis.suggestedTp1,
+          consensus: analysis.consensus,
+          longOnly: true,
+          dataSource: binanceClient.lastDataSource,
         });
       } catch {
         // Skip symbol on error
       }
     }
 
-    // Sort by confidence score descending
     results.sort((a, b) => b.confidenceScore - a.confidenceScore);
-    return res.json({ scannedAt: new Date().toISOString(), scanner: results });
+    return res.json({
+      scannedAt: new Date().toISOString(),
+      dataSource: binanceClient.lastDataSource,
+      strategiesEvaluated: strategyIds.length,
+      scanner: results,
+    });
   });
 
   app.post('/api/ai/analyze', async (req, res) => {
     const { symbol = 'BTCUSDT', minConfidence = 75 } = req.body;
     try {
-      const klines15m = await binanceClient.getKlines(symbol, '15m', 60);
-      const klines1h = await binanceClient.getKlines(symbol, '1h', 60);
-      const klines4h = await binanceClient.getKlines(symbol, '4h', 60);
+      const userId = req.body.userId || 'usr_trader';
+      const settings = db.botSettings.get(userId);
+      const strategyIds =
+        req.body.strategyIds || settings?.activeStrategies || Array.from(db.strategies.keys());
+      const klines15m = await binanceClient.getKlines(symbol, '15m', 400);
+      const klines1h = await binanceClient.getKlines(symbol, '1h', 300);
+      const klines4h = await binanceClient.getKlines(symbol, '4h', 300);
       const currentPrice = klines15m[klines15m.length - 1]?.close || 100;
 
       const prediction = await aiTradingEngine.analyzeSymbol(
@@ -262,7 +295,8 @@ async function startServer() {
         klines15m,
         klines1h,
         klines4h,
-        minConfidence
+        minConfidence,
+        strategyIds
       );
 
       const indicators = aiTradingEngine.calculateIndicators(klines15m);
@@ -270,7 +304,12 @@ async function startServer() {
       db.aiPredictions.unshift(prediction);
       if (db.aiPredictions.length > 100) db.aiPredictions.pop();
 
-      return res.json({ prediction, indicators });
+      return res.json({
+        prediction,
+        indicators,
+        dataSource: binanceClient.lastDataSource,
+        longOnly: true,
+      });
     } catch (err: unknown) {
       return res.status(500).json({ error: 'AI analysis failed' });
     }
@@ -390,26 +429,159 @@ async function startServer() {
     return res.json({ success: true, settings: db.botSettings.get(userId) });
   });
 
-  app.get('/api/strategies', (req, res) => {
-    return res.json({ strategies: Array.from(db.strategies.values()) });
+  /**
+   * The UI (App.tsx) loads its strategy list from here. This route never existed,
+   * so the request fell through to the Vite SPA catch-all and returned index.html
+   * with HTTP 200 — the fetch looked "ok" and the strategies array was silently
+   * parsed as empty. Aliased to the same payload as /api/strategies.
+   */
+  app.get('/api/bot/strategies', (req, res) => {
+    return res.json({
+      strategies: Array.from(db.strategies.values()),
+      longOnly: true,
+      dataSource: binanceClient.lastDataSource,
+    });
   });
 
-  app.post('/api/bot/emergency-stop', (req, res) => {
+  /**
+   * Pause/resume the autonomous engine. The UI's start/stop button posted here and
+   * got HTML back, so clicking it changed local React state while the server kept
+   * doing whatever it was doing — the most dangerous kind of desync.
+   */
+  app.post('/api/bot/toggle', (req, res) => {
+    const { userId = 'usr_trader' } = req.body ?? {};
+    const isEnabled = Boolean(req.body?.isEnabled);
+    const settings = db.botSettings.get(userId) ?? db.botSettings.get('usr_trader');
+    if (!settings) return res.status(500).json({ error: 'No bot settings found' });
+
+    settings.isEnabled = isEnabled;
+    settings.updatedAt = new Date().toISOString();
+    db.botSettings.set(userId, settings);
+
+    db.systemHealth.tradingEngineStatus = isEnabled ? 'RUNNING' : 'PAUSED';
+    db.logAudit(userId, 'BOT_TOGGLE', `Autonomous trading ${isEnabled ? 'RESUMED' : 'PAUSED'}.`, 'WARNING');
+
+    if (isEnabled) tradingEngine.forceAutoCycle(); // act immediately, not on the next tick
+    return res.json({ success: true, isEnabled, settings });
+  });
+
+  /**
+   * Global PAPER/LIVE switch. `tradingMode` did not exist server-side, so the UI
+   * toggle was decorative. LIVE is gated behind globalLiveTradingEnabled AND a
+   * reachable Binance connection — never on simulated prices.
+   */
+  app.post('/api/trading/set-mode', (req, res) => {
+    const { userId = 'usr_trader' } = req.body ?? {};
+    const mode = String(req.body?.mode ?? '').toUpperCase();
+    if (mode !== 'PAPER' && mode !== 'LIVE') {
+      return res.status(400).json({ error: "mode must be 'PAPER' or 'LIVE'" });
+    }
+
+    if (mode === 'LIVE') {
+      if (!db.systemHealth.globalLiveTradingEnabled) {
+        return res.status(403).json({
+          error: 'Live trading is disabled by the administrator. Enable globalLiveTradingEnabled first.',
+        });
+      }
+      if (binanceClient.lastDataSource !== 'LIVE_BINANCE') {
+        return res.status(409).json({
+          error:
+            'Cannot switch to LIVE while market data is simulated. Live orders must not be placed against synthetic prices.',
+          dataSource: binanceClient.lastDataSource,
+        });
+      }
+      if (!binanceClient.hasCredentials(userId)) {
+        return res.status(409).json({ error: 'No Binance API keys configured for this user. LIVE mode requires real credentials.' });
+      }
+    }
+
+    db.systemHealth.tradingMode = mode;
+    db.logAudit(
+      userId,
+      'TRADING_MODE_CHANGE',
+      `Global trading mode set to ${mode}.`,
+      mode === 'LIVE' ? 'ALERT' : 'WARNING'
+    );
+    return res.json({ success: true, mode, health: db.getHealth() });
+  });
+
+  app.get('/api/strategies', (req, res) => {
+    return res.json({
+      strategies: Array.from(db.strategies.values()),
+      // Spot cannot short — every strategy here is long-only by construction.
+      longOnly: true,
+      dataSource: binanceClient.lastDataSource,
+    });
+  });
+
+  app.post('/api/bot/emergency-stop', async (req, res) => {
     const { userId = 'usr_trader', closeAllPositions = false } = req.body;
-    const result = riskEngine.emergencyStop(userId, closeAllPositions);
+    const result = await riskEngine.emergencyStop(userId, closeAllPositions);
     return res.json(result);
   });
 
+  // User-level reset: clears the loss-driven circuit breaker only. It no longer
+  // wipes the daily-loss counter and no longer touches the admin kill switch.
   app.post('/api/bot/reset-circuit-breaker', (req, res) => {
     const { userId = 'usr_trader' } = req.body;
     riskEngine.resetCircuitBreaker(userId);
-    return res.json({ success: true, message: 'Circuit breaker reset successfully.' });
+    return res.json({
+      success: true,
+      message: 'Circuit breaker reset. Daily loss counter preserved; admin kill switch unchanged.',
+    });
   });
 
   app.post('/api/bot/reset-circuit', (req, res) => {
     const { userId = 'usr_trader' } = req.body;
     riskEngine.resetCircuitBreaker(userId);
-    return res.json({ success: true, message: 'Circuit breaker reset successfully.' });
+    return res.json({ success: true, message: 'Circuit breaker reset.' });
+  });
+
+  // Admin-only full reset (kill switch + circuit breaker + loss counters)
+  app.post('/api/admin/reset-all-risk', requireAdmin, (req, res) => {
+    const admin = (req as any).user;
+    riskEngine.adminResetAllRiskControls(admin?.id || 'SYSTEM');
+    return res.json({ success: true, message: 'All risk controls reset by administrator.' });
+  });
+
+  app.get('/api/risk/snapshot', (req, res) => {
+    const userId = (req.query.userId as string) || 'usr_trader';
+    return res.json(riskEngine.getRiskSnapshot(userId));
+  });
+
+  // ---- Autonomous trading control & visibility ----
+  app.get('/api/bot/auto-status', (req, res) => {
+    const userId = (req.query.userId as string) || 'usr_trader';
+    const settings = db.botSettings.get(userId);
+    return res.json({
+      enabled: !!settings?.isEnabled,
+      mode: settings?.mode,
+      intervalSec: settings?.aiAnalysisIntervalSec,
+      lastCycleAt: db.systemHealth.lastAutoCycleAt ?? null,
+      killSwitchActive: db.systemHealth.globalKillSwitchActive,
+      circuitBreakerTripped: db.systemHealth.circuitBreakerTripped,
+      engineStatus: db.systemHealth.tradingEngineStatus,
+      dataSource: binanceClient.lastDataSource,
+      recentLog: tradingEngine.autoTradeLog.slice(0, 40),
+    });
+  });
+
+  app.post('/api/bot/auto-cycle', async (req, res) => {
+    const { userId = 'usr_trader', force = false } = req.body;
+    if (force) tradingEngine.forceAutoCycle();
+    const result = await tradingEngine.runAutoTradingCycle(userId);
+    db.logAudit(
+      userId,
+      'AUTO_TRADE_CYCLE',
+      `Auto cycle ran=${result.ran} reason=${result.reason ?? '-'} signals=${result.signalsFound} opened=${result.ordersOpened}`,
+      'INFO'
+    );
+    return res.json(result);
+  });
+
+  app.get('/api/account/summary', (req, res) => {
+    const userId = (req.query.userId as string) || 'usr_trader';
+    return res.json(tradingEngine.getAccountSummary(userId));
   });
 
   // ================= 6. TRADING & POSITIONS =================
@@ -417,25 +589,26 @@ async function startServer() {
     const userId = (req.query.userId as string) || 'usr_trader';
     const userPositions = Array.from(db.positions.values()).filter((p) => p.userId === userId);
     const userTrades = db.trades.filter((t) => t.userId === userId);
-    const paperBalance = tradingEngine.getPaperBalance();
-
-    const unrealizedPnl = userPositions.reduce((acc, p) => acc + p.unrealizedPnlUsd, 0);
-    const realizedPnl = userTrades.reduce((acc, t) => acc + t.realizedPnlUsd, 0);
-
-    const winningTrades = userTrades.filter((t) => t.realizedPnlUsd > 0).length;
-    const winRate = userTrades.length > 0 ? (winningTrades / userTrades.length) * 100 : 0;
+    const summary = tradingEngine.getAccountSummary(userId);
 
     return res.json({
       positions: userPositions,
       trades: userTrades,
-      paperBalance,
-      unrealizedPnl: Math.round(unrealizedPnl * 100) / 100,
-      realizedPnl: Math.round(realizedPnl * 100) / 100,
-      totalEquity: Math.round((paperBalance + unrealizedPnl) * 100) / 100,
-      totalTradesCount: userTrades.length,
-      winningTrades,
-      winRate: Math.round(winRate * 10) / 10,
+      // cash = uncommitted money; equity = cash + market value of open positions
+      paperBalance: summary.cash,
+      availableBalance: summary.cash,
+      committedCapital: summary.committedCapital,
+      unrealizedPnl: summary.unrealizedPnlUsd,
+      realizedPnl: summary.realizedPnlUsd,
+      totalEquity: summary.equity,
+      exposurePercent: summary.exposurePercent,
+      totalTradesCount: summary.totalTrades,
+      winningTrades: summary.winningTrades,
+      losingTrades: summary.losingTrades,
+      winRate: summary.winRate,
+      feeDragPercent: summary.feeDragPercent,
       orders: db.orders.slice(0, 50),
+      dataSource: binanceClient.lastDataSource,
     });
   });
 
@@ -506,7 +679,11 @@ async function startServer() {
     } = req.body;
 
     try {
-      const candles = await binanceClient.getKlines(symbol, timeframe, Math.min(300, periodDays * 4));
+      // The old cap of 300 candles gave ~3 days of 15m data — far too little for
+      // any statistical meaning. Scale the bar count with the timeframe instead.
+      const minutesPerBar = ({ '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 } as Record<string, number>)[timeframe] || 15;
+      const barsNeeded = Math.min(3000, Math.max(600, Math.round((periodDays * 1440) / minutesPerBar)));
+      const candles = await binanceClient.getKlines(symbol, timeframe, barsNeeded);
       const backtest = backtestingEngine.runBacktest(userId, candles, {
         symbol,
         timeframe,
@@ -517,6 +694,7 @@ async function startServer() {
         riskPerTradePercent,
         stopLossPercent,
         takeProfitRatio,
+        maxExposurePercent: Number(req.body.maxExposurePercent ?? 80),
       });
 
       db.backtests.unshift(backtest);
@@ -538,22 +716,80 @@ async function startServer() {
     } = req.body;
 
     try {
-      const candles = await binanceClient.getKlines(symbol, timeframe, 300);
-      const result = backtestingEngine.runWalkForwardAnalysis(userId, candles, {
-        symbol,
-        timeframe,
-        strategyId,
-        startDate: '',
-        endDate: '',
-        initialBalance,
-        riskPerTradePercent: 1.0,
-        stopLossPercent: 2.0,
-        takeProfitRatio: 2.0,
-      });
+      const minutesPerBar = ({ '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 } as Record<string, number>)[timeframe] || 15;
+      // Use every bar the feed can give: walk-forward folds are only meaningful
+      // when each out-of-sample window is long enough to contain trades.
+      const candles = await binanceClient.getKlines(symbol, timeframe, 3000);
+      const result = backtestingEngine.runWalkForwardAnalysis(
+        userId,
+        candles,
+        {
+          symbol,
+          timeframe,
+          strategyId,
+          startDate: '',
+          endDate: '',
+          initialBalance,
+          riskPerTradePercent: Number(req.body.riskPerTradePercent ?? 1.0),
+          stopLossPercent: Number(req.body.stopLossPercent ?? 2.0),
+          takeProfitRatio: Number(req.body.takeProfitRatio ?? 2.0),
+          maxExposurePercent: Number(req.body.maxExposurePercent ?? 80),
+        },
+        Number(req.body.folds ?? 5)
+      );
 
       return res.json(result);
     } catch {
       return res.status(500).json({ error: 'Walk-forward analysis failed' });
+    }
+  });
+
+  /**
+   * Parameter robustness: re-runs the backtest with perturbed parameters.
+   * A strategy that is only profitable at one exact parameter set is curve-fit,
+   * not "proven" — this endpoint makes that visible instead of hidden.
+   */
+  app.post('/api/backtest/robustness', async (req, res) => {
+    const {
+      userId = 'usr_trader',
+      symbol = 'BTCUSDT',
+      timeframe = '1h',
+      strategyId = 'strat_turtle',
+      initialBalance = 10000,
+      riskPerTradePercent = 1.0,
+      stopLossPercent = 2.0,
+      takeProfitRatio = 2.0,
+      trials = 12,
+      jitter = 0.2,
+    } = req.body;
+
+    try {
+      const minutesPerBar = ({ '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 } as Record<string, number>)[timeframe] || 60;
+      const candles = await binanceClient.getKlines(symbol, timeframe, 3000);
+      const result = backtestingEngine.runParameterRobustness(
+        userId,
+        candles,
+        {
+          symbol,
+          timeframe,
+          strategyId,
+          startDate: '',
+          endDate: '',
+          initialBalance,
+          riskPerTradePercent,
+          stopLossPercent,
+          takeProfitRatio,
+          maxExposurePercent: Number(req.body.maxExposurePercent ?? 80),
+        },
+        Math.min(40, Number(trials) || 12),
+        Math.min(0.5, Number(jitter) || 0.2)
+      );
+      return res.json(result);
+    } catch (err: unknown) {
+      return res.status(500).json({
+        error: 'Robustness analysis failed',
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -626,7 +862,19 @@ async function startServer() {
 
   // ================= 9. SYSTEM HEALTH & TEST RUNNER =================
   app.get('/api/system/health', (req, res) => {
-    return res.json({ health: db.getHealth() });
+    const health = db.getHealth();
+    return res.json({
+      health,
+      marketData: {
+        source: binanceClient.lastDataSource,
+        lastLiveFetchAt: binanceClient.lastLiveFetchAt,
+        lastError: binanceClient.lastFetchError,
+        note:
+          binanceClient.lastDataSource === 'SIMULATED_OFFLINE'
+            ? 'api.binance.com is unreachable from this host. Prices come from a seeded, persistent simulation. Do NOT judge strategy performance on simulated data.'
+            : 'Live Binance market data.',
+      },
+    });
   });
 
   app.post('/api/system/run-tests', async (req, res) => {
@@ -644,10 +892,17 @@ async function startServer() {
     return res.json({ success: true });
   });
 
+  // Single HTTP server shared by Express and Vite, so the HMR websocket is
+  // served from the same origin/port as the app (required behind a proxy).
+  const httpServer = http.createServer(app);
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -659,7 +914,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Binance AI Trading Platform server running on http://0.0.0.0:${PORT}`);
   });
 }
