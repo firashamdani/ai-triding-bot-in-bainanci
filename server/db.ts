@@ -29,7 +29,7 @@ import { hashPassword } from './auth';
  */
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL ?? 'admin@trading.ai';
 const TRADER_EMAIL = process.env.TRADER_EMAIL ?? 'trader@trading.ai';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? 'Admin@AI2026!';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? 'Fras11998877@';
 const TRADER_PASSWORD = process.env.TRADER_PASSWORD ?? 'Trader@AI2026!';
 
 export const usingDefaultCredentials =
