@@ -48,3 +48,40 @@ export function verifyPassword(plain: string, stored: string): boolean {
 export function generateToken(): string {
   return crypto.randomBytes(32).toString('hex');
 }
+
+/** A server-issued session record. */
+export interface Session {
+  userId: string;
+  role: string;
+  createdAt: number;
+}
+
+/**
+ * Resolve an Authorization header to a user id, or undefined.
+ *
+ * Extracted as a pure function so the authentication boundary is directly
+ * testable — it previously lived in a closure inside createServer(), which meant
+ * the RBAC bypass could not be covered by any test.
+ *
+ * Only the session map is consulted. Nothing is parsed out of the token itself and
+ * no other request header is read, so a token is meaningless unless this server
+ * issued it and it has not expired.
+ */
+export function resolveSessionUser(
+  authorizationHeader: string | undefined,
+  sessions: Map<string, Session>,
+  ttlMs: number,
+  now: number = Date.now()
+): string | undefined {
+  const token = authorizationHeader?.replace(/^Bearer\s+/i, '').trim();
+  if (!token) return undefined;
+
+  const session = sessions.get(token);
+  if (!session) return undefined;
+
+  if (now - session.createdAt > ttlMs) {
+    sessions.delete(token);
+    return undefined;
+  }
+  return session.userId;
+}

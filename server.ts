@@ -10,7 +10,7 @@ import { tradingEngine } from './server/tradingEngine';
 import { backtestingEngine } from './server/backtestEngine';
 import { runAllTests } from './server/testSuite';
 import { User } from './server/types';
-import { generateToken, hashPassword, verifyPassword } from './server/auth';
+import { generateToken, hashPassword, resolveSessionUser, verifyPassword } from './server/auth';
 
 async function startServer() {
   const app = express();
@@ -52,18 +52,8 @@ async function startServer() {
    * and is meaningless unless this server issued it.
    */
   function getRequestUser(req: express.Request): User | undefined {
-    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim();
-    if (!token) return undefined;
-
-    const session = activeTokens.get(token);
-    if (!session) return undefined;
-
-    // Reject expired sessions rather than trusting them forever.
-    if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-      activeTokens.delete(token);
-      return undefined;
-    }
-    return db.users.get(session.userId);
+    const userId = resolveSessionUser(req.headers.authorization, activeTokens, SESSION_TTL_MS);
+    return userId ? db.users.get(userId) : undefined;
   }
 
   function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {

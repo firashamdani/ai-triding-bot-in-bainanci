@@ -641,11 +641,24 @@ export default function App() {
         }}
         onDirectLogin={async (email, password) => {
           try {
-            const pass = password || (email.includes('admin') ? 'Admin@AI2026!' : 'Trader@AI2026!');
+            // SECURITY: this used to read
+            //   const pass = password || (email.includes('admin') ? 'Admin@AI2026!' : 'Trader@AI2026!');
+            // so submitting the form with an EMPTY password field made the client
+            // fill in the real admin password itself. Anyone could sign in as ADMIN
+            // by typing an admin email and leaving the password blank — which also
+            // defeated the server-side hashing, since the correct secret was still
+            // being supplied. A blank password must fail.
+            if (!password) {
+              showToast(
+                lang === 'ar' ? 'كلمة المرور مطلوبة.' : 'Password is required.',
+                'error'
+              );
+              return;
+            }
             const res = await fetch('/api/auth/login', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ email, password: pass }),
+              body: JSON.stringify({ email, password }),
             });
             if (res.ok) {
               const data = await res.json();
