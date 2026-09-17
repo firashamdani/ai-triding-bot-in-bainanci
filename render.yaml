@@ -1,0 +1,22 @@
+# Render.com one-click deploy configuration.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: binance-ai-trading-platform
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false # set in Render dashboard
+      - key: APP_URL
+        sync: false # set to your Render service URL
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: TRADER_EMAIL
+        sync: false
+      - key: TRADER_PASSWORD
+        sync: false
+    healthCheckPath: /
